@@ -1,0 +1,294 @@
+# BENCH firmware for the transmit stage (docs/hardware.md §2): checks the stage on a bench line before it ever
+# touches the heat pump.
+#
+# ⚠️ BENCH LINE ONLY. Never connect it to the heat pump's wires with this firmware.
+#    Safeguard in the code (ciat_bench.h): transmission is only possible after 5 s of total silence on the line.
+#    On the heat pump's bus (one request every ~106 ms) it therefore never starts.
+#    NEVER connect the ground of an earthed device (oscilloscope, PC, mains charger) to a bus wire.
+#
+# Bench line:
+#   12 V DC supply (a mains adapter on its own, nothing else connected to it)
+#     + of the supply ──[300 Ω, 1 W]──┬── bench "wire +"
+#     − of the supply ────────────────┴── bench "wire −"
+#   On these two wires: the receive stage (HCPL-0501 #1, polarity matters) and the transmit stage (MB10S bridge).
+#   The ESP32 stays powered by its USB charger. Battery multimeter, as a DC voltmeter between wire + and wire −.
+#   Schematic: hardware/interface.svg.
+#
+# Procedure:
+#   1. Flash. "Bench state" goes from "waiting for 5 s of silence" to "ready". If it stays on "line not powered", the
+#      receive stage does not see the line: check the supply and the receive polarity.
+#   2. Mode "Stop": measure the supply voltage ("Bench supply voltage") then the voltage between wire + and wire −
+#      ("Bench measured idle voltage"). Expected ~11 V (the receive stage draws ~2 mA through the series resistor).
+#   3. "Bench transmission allowed" on, mode "Multimeter pattern": measure the average voltage between wire + and
+#      wire − and enter it in "Bench measured average voltage". Read "Bench computed low level" (expected ≤ 2-3 V;
+#      ~1.3-1.6 V measured: 2 MB10S diodes + 10 Ω + saturated BC817) and "Bench computed low current" (~35-45 mA).
+#   4. Mode "Echo" for a few minutes: "Bench wrong echoes" must stay at 0. Bit deviations: "Bench 0 bits / 1 bits
+#      deviation" sensors (µs). They measure the transmit + receive distortion (~23 µs on 0 bits is fine).
+#   5. Safety: cut the bench supply. Expected: TX detached, state "LOCKED" if the cut falls between two frames
+#      (Re-arm afterwards), "line not powered" if it falls during a frame (1 wrong echo). When power is back: 5 s wait,
+#      then "ready".
+#   6. Before connecting the ESP32 to the heat pump: flash ciat-emulator.yaml again.
+#
+# Name: the same device as ciat-emulator.yaml, to switch between the two over Wi-Fi. The emulator's entities become
+# unavailable in HA during the bench test, then come back. With a 2nd ESP32: set name: ciat-bench (first install
+# over USB).
+# Secrets: the same as ciat-emulator.yaml.
+
+substitutions:
+  name: ciat-microconnect
+  rx_gpio: "20"
+  tx_gpio: "10"
+
+esphome:
+  name: ${name}
+  friendly_name: CIAT bench
+  includes:
+    - ciat_bench.h
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            ESP_LOGW("bench", "BENCH FIRMWARE: bench line only, never on the heat pump");
+            if (!ciat::bench::bench().start(${rx_gpio}, ${tx_gpio}))
+              ESP_LOGE("bench", "UART: installation failed");
+
+esp32:
+  board: esp32-c3-devkitm-1   # ESP32-C3 Super Mini
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret ciat_api_key
+
+ota:
+  - platform: esphome
+    password: !secret ciat_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 8.5dB
+
+select:
+  - platform: template
+    name: "Bench mode"
+    id: sel_mode
+    options:
+      - "Stop"
+      - "Multimeter pattern"
+      - "Echo"
+    initial_option: "Stop"
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: |-
+          uint8_t m = ciat::bench::STOP;
+          if (x == "Multimeter pattern") m = ciat::bench::PATTERN;
+          else if (x == "Echo") m = ciat::bench::ECHO;
+          ciat::bench::bench().mode(m);
+
+switch:
+  - platform: template
+    name: "Bench transmission allowed"
+    id: sw_tx
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: ciat::bench::bench().allow(true);
+    turn_off_action:
+      - lambda: ciat::bench::bench().allow(false);
+
+button:
+  - platform: template
+    name: "Bench re-arm"
+    on_press:
+      - lambda: ciat::bench::bench().rearm();
+  - platform: template
+    name: "Bench reset counters"
+    on_press:
+      - lambda: ciat::bench::bench().reset_stats();
+
+number:
+  - platform: template
+    name: "Bench pattern period"
+    id: n_period
+    unit_of_measurement: ms
+    min_value: 10
+    max_value: 200
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: ciat::bench::bench().period_ms((uint32_t) x);
+  # Values read on the multimeter, entered by hand.
+  - platform: template
+    name: "Bench supply voltage"
+    id: n_v_supply
+    unit_of_measurement: V
+    min_value: 0
+    max_value: 20
+    step: 0.01
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    name: "Bench measured idle voltage"
+    id: n_v_idle
+    unit_of_measurement: V
+    min_value: 0
+    max_value: 20
+    step: 0.01
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    name: "Bench measured average voltage"
+    id: n_v_avg
+    unit_of_measurement: V
+    min_value: 0
+    max_value: 20
+    step: 0.01
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    name: "Bench line resistance"
+    id: n_r
+    unit_of_measurement: "Ω"
+    min_value: 10
+    max_value: 2000
+    step: 1
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+    mode: box
+
+text_sensor:
+  - platform: template
+    name: "Bench state"
+    id: t_state
+  - platform: template
+    name: "Bench last wrong echo"
+    id: t_bad
+
+sensor:
+  - platform: template
+    name: "Bench frames sent"
+    id: s_sent
+    accuracy_decimals: 0
+    state_class: total_increasing
+  - platform: template
+    name: "Bench correct echoes"
+    id: s_ok
+    accuracy_decimals: 0
+    state_class: total_increasing
+  - platform: template
+    name: "Bench wrong echoes"
+    id: s_bad
+    accuracy_decimals: 0
+    state_class: total_increasing
+  - platform: template
+    name: "Bench foreign edges"
+    id: s_foreign
+    accuracy_decimals: 0
+    state_class: total_increasing
+  - platform: template
+    name: "Bench lost edges"
+    id: s_lost
+    accuracy_decimals: 0
+    entity_category: diagnostic
+  - platform: template
+    name: "Bench 0 bits deviation average"
+    id: s_low_avg
+    unit_of_measurement: "µs"
+    accuracy_decimals: 1
+  - platform: template
+    name: "Bench 0 bits deviation min"
+    id: s_low_min
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+  - platform: template
+    name: "Bench 0 bits deviation max"
+    id: s_low_max
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+  - platform: template
+    name: "Bench 1 bits deviation average"
+    id: s_high_avg
+    unit_of_measurement: "µs"
+    accuracy_decimals: 1
+  - platform: template
+    name: "Bench 1 bits deviation min"
+    id: s_high_min
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+  - platform: template
+    name: "Bench 1 bits deviation max"
+    id: s_high_max
+    unit_of_measurement: "µs"
+    accuracy_decimals: 0
+  - platform: template
+    name: "Bench pattern duty cycle"
+    id: s_duty
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+  # Low level: V_avg = (1 − d) × V_idle + d × V_low, d = duty cycle (time the line is pulled low).
+  # Approximate: d is computed on the bits sent, without the edge distortion (see the deviations above).
+  - platform: template
+    name: "Bench computed low level"
+    id: s_v_low
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    update_interval: 3s
+    lambda: |-
+      float d = id(s_duty).state / 100.0f;
+      float vh = id(n_v_idle).state, vm = id(n_v_avg).state;
+      if (std::isnan(d) || d < 0.05f || std::isnan(vh) || std::isnan(vm) || vh <= 0 || vm <= 0) return NAN;
+      return (vm - (1.0f - d) * vh) / d;
+  - platform: template
+    name: "Bench computed low current"
+    id: s_i_low
+    unit_of_measurement: mA
+    accuracy_decimals: 1
+    update_interval: 3s
+    lambda: |-
+      float va = id(n_v_supply).state, vb = id(s_v_low).state, r = id(n_r).state;
+      if (std::isnan(va) || std::isnan(vb) || va <= 0 || std::isnan(r) || r <= 0) return NAN;
+      return (va - vb) / r * 1000.0f;
+
+interval:
+  - interval: 3s
+    then:
+      - lambda: |-
+          auto s = ciat::bench::bench().stats();
+          std::string e = ciat::bench::state_name(s.state);
+          if (s.state == ciat::bench::READY && ciat::bench::bench().tx_connected()) e += " (TX connected)";
+          if (id(t_state).state != e) id(t_state).publish_state(e);
+          if (s.last_bad[0] && id(t_bad).state != s.last_bad) id(t_bad).publish_state(s.last_bad);
+          id(s_sent).publish_state(s.sent);
+          id(s_ok).publish_state(s.echo_ok);
+          id(s_bad).publish_state(s.echo_bad);
+          id(s_foreign).publish_state(s.foreign);
+          id(s_lost).publish_state(s.lost);
+          if (s.low.n) {
+            id(s_low_avg).publish_state(s.low.mean());
+            id(s_low_min).publish_state(s.low.min);
+            id(s_low_max).publish_state(s.low.max);
+          }
+          if (s.high.n) {
+            id(s_high_avg).publish_state(s.high.mean());
+            id(s_high_min).publish_state(s.high.min);
+            id(s_high_max).publish_state(s.high.max);
+          }
+          id(s_duty).publish_state(s.duty * 100.0f);

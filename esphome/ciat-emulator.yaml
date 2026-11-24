@@ -1,0 +1,1306 @@
+# ESP32 "virtual terminal" for the CIAT Micro-Connect bus <-> Aqualis 2 heat pump.
+# Documentation: docs/emulator.md (design, entities), docs/hardware.md (wiring), docs/protocol.md (bus).
+#
+# Two ways to run it:
+#   - tx_compiled: "false" (default): LISTEN ONLY. The TX pin is never connected to the UART and stays an input
+#     pulled up to 3.3 V (transmit optocoupler LED off). With the original terminal still connected, you get the full
+#     decoding in Home Assistant, plus SHADOW MODE: the terminal's answer delay, its 12.1 checked bit by bit against
+#     the emulator's rules, and the 12.1 the emulator would send, published for comparison. Values viewed on the real
+#     terminal's menu are published too (passive survey).
+#   - tx_compiled: "true": the ESP32 can REPLACE the terminal (unplug the original one). Nothing is sent until the
+#     "Bus transmission" switch is turned on. Then: climate entities (heating, pool), automatic reading of the
+#     measurements and settings through the menu, and low-level commands behind a "Rescue mode" switch.
+#
+# Wiring: receive on GPIO20 (HCPL-0501 #1), transmit on GPIO10 (HCPL-0501 #2). Never GPIO21: the ROM writes its log
+# there at boot. NEVER connect the ESP32 ground, or the ground of an earthed device, to a bus wire.
+#
+# The UART is not handled by ESPHome's `uart:` component but by a FreeRTOS task (ciat_link.h) that time-stamps every
+# byte and answers on time even if the ESPHome loop or the network stall.
+#
+# Secrets (secrets.yaml): wifi_ssid, wifi_password, ciat_api_key, ciat_ota_password.
+
+substitutions:
+  rx_gpio: "20"
+  tx_gpio: "10"
+  # "false": transmission impossible (listen only). "true": the ESP32 may answer the heat pump. Even compiled, nothing
+  # leaves until the "Bus transmission" switch is turned on. Bench-test the transmit stage first (docs/hardware.md).
+  tx_compiled: "false"
+  # Home Assistant room temperature sensor sent to the heat pump instead of the terminal's own sensor: REPLACE IT.
+  # As long as no value was ever received, the room temperature is unknown and the emulator does not answer (safe).
+  # ⚠️ Do NOT use this device's own "Terminal room temperature": once the terminal is removed, it would read back our
+  # own transmission and stay frozen (the heat pump would regulate on a fixed value).
+  room_sensor: sensor.living_room_temperature
+
+esphome:
+  name: ciat-microconnect
+  friendly_name: CIAT heat pump
+  includes:
+    - ciat_bus.h
+    - ciat_emul.h
+    - ciat_link.h
+    - ciat_nav.h
+    - ciat_flash.h
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            if (!ciat::link::link().start(${rx_gpio}, ${tx_gpio}, ${tx_compiled}))
+              ESP_LOGE("ciat", "bus UART: installation failed");
+    - priority: -100   # settings saved in flash: published again in the "Settings" texts
+      then:
+        - lambda: |-
+            auto &r = ciat::nav::survey();
+            int n = ciat::flash::load(r);
+            if (n < 0) { ESP_LOGI("nav", "no setting saved in flash"); return; }
+            ESP_LOGI("nav", "%d settings restored from flash", n);
+            std::string a = ciat::nav::settings_text(r, false), b = ciat::nav::settings_text(r, true);
+            if (!a.empty()) id(settings_1).publish_state(a);  // empty half: stays "unknown"
+            if (!b.empty()) id(settings_2).publish_state(b);
+
+esp32:
+  board: esp32-c3-devkitm-1   # ESP32-C3 Super Mini
+  variant: esp32c3
+  framework:
+    type: esp-idf             # the code uses nothing from Arduino
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # log on native USB: the UART stays free for the bus
+  level: INFO   # every frame that changes is logged (INFO level)
+
+api:
+  reboot_timeout: 0s   # never reboot for lack of Home Assistant: the bus must go on without the network
+  encryption:
+    key: !secret ciat_api_key
+
+ota:
+  - platform: esphome
+    password: !secret ciat_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 8.5dB   # ESP32-C3 Super Mini: at full power, the poorly matched antenna often prevents Wi-Fi from connecting
+  # No reboot without Wi-Fi (ESPHome default: 15 min): the bus must go on without the network.
+  reboot_timeout: 0s
+
+globals:   # the parser itself is in ciat_bus.h (ciat::parser())
+  - id: saved_room_temp   # last valid room temperature, kept in flash: the emulator still answers without HA
+    type: float
+    restore_value: true
+    initial_value: 'NAN'
+  - id: t_fast_scan   # millis() of the last fast scan started (0 = never)
+    type: uint32_t
+    initial_value: '0'
+  - id: t_slow_scan
+    type: uint32_t
+    initial_value: '0'
+  - id: slow_scan_due    # slow scan to do as soon as possible (boot, after a write)
+    type: bool
+    initial_value: 'true'
+  - id: t_rescue  # millis() when "Rescue mode" was turned on
+    type: uint32_t
+    initial_value: '0'
+  - id: n_hp
+    type: uint32_t
+    initial_value: '0'
+  - id: n_terminal
+    type: uint32_t
+    initial_value: '0'
+  - id: last_frame_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: n_ae
+    type: uint32_t
+    initial_value: '0'
+  - id: ae_text   # AE frame waiting for the heat pump's answer
+    type: std::string
+  # Thermostats: pending requests, applied when the navigator is free.
+  - id: requested_setpoint   # room setpoint to adjust outside the menu (NAN: nothing to do)
+    type: float
+    initial_value: 'NAN'
+  - id: tx_wanted     # user's choice for "Bus transmission", kept in flash (resumed at boot)
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: setpoint_dial    # dial position the requested setpoint applies to (6 heating, 8 pool)
+    type: uint8_t
+    initial_value: '6'
+  - id: requested_dial    # dial code to apply (4 off, 5 frost protection, 6 heating, 8 pool; 0: nothing to do)
+    type: uint8_t
+    initial_value: '0'
+  - id: t_dial           # millis() of the last dial change (the heat pump changes its display ~1.1 s later)
+    type: uint32_t
+    initial_value: '0'
+  - id: slow_scan_running  # the current scan is the settings scan (to be redone if interrupted)
+    type: bool
+    initial_value: 'false'
+  - id: stable_setpoint     # setpoint shown outside the menu, seen identical on 2 consecutive cycles (NAN: unknown)
+    type: float
+    initial_value: 'NAN'
+
+interval:
+  # Decoding of the stream copied by the bus task (2 kB buffer: ~2 s of traffic).
+  - interval: 10ms
+    then:
+      - lambda: |-
+          uint8_t f[32];
+          size_t L;
+          uint8_t rd[64];
+          size_t nrd;
+          // Publication of a parameter read (navigator or passive survey).
+          auto publish = [&](int p, const ciat::nav::Reading &l) {
+            sensor::Sensor *s = nullptr;
+            switch (p) {
+              case 40: s = id(p40); break; case 41: s = id(p41); break; case 42: s = id(p42); break;
+              case 43: s = id(p43); break; case 44: s = id(p44); break; case 45: s = id(p45); break;
+              case 46: s = id(p46); break; case 47: s = id(p47); break; case 48: s = id(p48); break;
+              case 49: s = id(p49); break; case 50: s = id(p50); break;
+              default: break;
+            }
+            if (s && p == 46 && !std::isnan(l.val)) {  // P46: minutes.seconds ("2.52") published in seconds
+              int m = (int) l.val, sec = (int) std::lround((l.val - m) * 100.0f);
+              s->publish_state(m * 60 + sec);
+              return;
+            }
+            if (s) { s->publish_state(l.val); return; }  // NAN for "----" (P42 when the heat pump asks for nothing)
+            // Settings: two texts "P04=3.5 P05=0 …" (an HA state is limited to 255 characters).
+            const bool upper = p >= 30;
+            std::string t = ciat::nav::settings_text(ciat::nav::survey(), upper);
+            text_sensor::TextSensor *ts = upper ? id(settings_2) : id(settings_1);
+            if (!ts->has_state() || ts->state != t) ts->publish_state(t);
+          };
+          auto stamp = [&](const char *fmt) {
+            auto now = id(ha_time).now();
+            return now.is_valid() ? now.strftime(fmt) : std::string("??");
+          };
+          auto handle = [&](const ciat::nav::Event &e) {
+            using E = ciat::nav::Event;
+            char t[200];
+            switch (e.type) {
+              case E::VALUE:
+                ciat::nav::survey().set(e.p, e.reading);
+                publish(e.p, e.reading);
+                break;
+              case E::ABSENT:
+                ESP_LOGI("nav", "P%02d absent from the menu", e.p);
+                break;
+              case E::SCAN_END:
+                snprintf(t, sizeof t, "%s %s", stamp("%H:%M:%S").c_str(), e.msg.c_str());
+                id(nav_last_scan).publish_state(t);
+                ESP_LOGI("nav", "scan finished: %s", e.msg.c_str());
+                break;
+              case E::WRITTEN:
+                ciat::nav::survey().set(e.p, e.reading);
+                publish(e.p, e.reading);
+                snprintf(t, sizeof t, "%s P%02d: %.1f -> %s (read back)", stamp("%d/%m %H:%M").c_str(), e.p, e.old,
+                         e.reading.txt.c_str());
+                id(nav_last_write).publish_state(t);
+                ESP_LOGW("nav", "write: %s", t);
+                id(slow_scan_due) = true;
+                id(sw_rescue).turn_off();
+                break;
+              case E::ERROR:
+                snprintf(t, sizeof t, "%s %s", stamp("%d/%m %H:%M:%S").c_str(), e.msg.c_str());
+                id(nav_error).publish_state(t);
+                ESP_LOGW("nav", "error: %s", e.msg.c_str());
+                break;
+              case E::SETPOINT:
+                snprintf(t, sizeof t, "%s setpoint %.1f -> %s (read back)", stamp("%d/%m %H:%M").c_str(), e.old,
+                         e.reading.txt.c_str());
+                id(nav_last_write).publish_state(t);
+                id(stable_setpoint) = e.reading.val;
+                ESP_LOGW("nav", "%s", t);
+                break;
+            }
+          };
+          while ((nrd = ciat::link::link().read(rd, sizeof rd)) > 0)
+          for (size_t i = 0; i < nrd; i++) {
+            uint8_t b = rd[i];
+            if (!ciat::parser().feed(b, f, L)) continue;
+            id(last_frame_ms) = millis();
+            if (ciat::parser().rej_ready) {  // bytes were dropped just before this frame
+              auto &p = ciat::parser();
+              p.rej_ready = false;
+              std::string r = ciat::reject_text(p);
+              id(last_reject).publish_state(r);
+              ESP_LOGW("ciat", "rejected: %s", r.c_str());
+            }
+            switch (f[0]) {
+              case 0x40: {  // 12.2 heat pump -> terminal: display and pictograms
+                id(n_hp)++;
+                if (!id(ae_text).empty()) {  // first heat-pump answer after an AE frame
+                  std::string s = id(ae_text) + " | heat pump after " + ciat::hex(f, 8);
+                  id(ae_frame).publish_state(s);
+                  ESP_LOGW("ciat", "AE: %s", s.c_str());
+                  id(ae_text).clear();
+                }
+                std::string txt = ciat::lcd(f + 3);
+                {  // watch: frames never seen and single-cycle frames, dated by the ESP (HA time to the second)
+                  std::string nw, single;
+                  int r = ciat::hp_watch().frame(f, nw, single);
+                  if (r) {
+                    auto now = id(ha_time).now();
+                    std::string h = now.is_valid() ? now.strftime("%H:%M:%S ") : std::string("?? ");
+                    if (r & 1) {
+                      id(new_hp_frame).publish_state(h + nw);
+                      id(distinct_hp_frames).publish_state(ciat::hp_watch().n_seen);
+                      ESP_LOGW("ciat", "new 12.2: %s", nw.c_str());
+                    }
+                    if (r & 2) {
+                      id(single_cycle_hp_frame).publish_state(h + single);
+                      id(single_cycle_hp_frames).publish_state(ciat::hp_watch().n_single);
+                      ESP_LOGW("ciat", "single-cycle 12.2: %s", single.c_str());
+                    }
+                  }
+                }
+                {  // passive survey and navigator: one 12.2 = one cycle
+                  ciat::nav::View v = ciat::nav::view(f);
+                  int pr = ciat::nav::survey().observe(v);
+                  if (pr >= 0) publish(pr, ciat::nav::survey().tab[pr]);
+                  auto &nv = ciat::nav::navigator();
+                  nv.cycle(v);
+                  ciat::nav::Keys k;
+                  if (nv.press_to_send(k)) ciat::link::link().press(k.keys, k.frames);
+                  ciat::nav::Event e;
+                  while (nv.take_event(e)) handle(e);
+                }
+                {
+                  std::string ap;
+                  if (ciat::press().heat_pump(f, txt, millis(), ap)) {
+                    id(last_press).publish_state(ap);
+                    ESP_LOGW("ciat", "press: %s", ap.c_str());
+                  }
+                }
+                {  // display: raw text, except a measurement being shown (P40-P50): its average (ciat_nav.h, Survey)
+                  auto &r = ciat::nav::survey();
+                  const std::string &a = r.filter_active() ? r.shown() : txt;
+                  if (!id(display_text).has_state() || id(display_text).state != a) id(display_text).publish_state(a);
+                }
+                // setpoint: only if the display ends with "c" and the parameter menu is closed
+                float v;
+                if ((f[2] & 0x03) == 0 && !txt.empty() && txt.back() == 'c' && ciat::lcd_number(txt, v) &&
+                    (std::isnan(id(displayed_setpoint).state) || id(displayed_setpoint).state != v))
+                  id(displayed_setpoint).publish_state(v);
+                {  // stable setpoint (thermostat): same value on 2 consecutive cycles, menu closed
+                  static float prev = NAN;
+                  float c = NAN;
+                  if ((f[2] & 0x03) == 0 && !txt.empty() && txt.back() == 'c') ciat::lcd_number(txt, c);
+                  if (!std::isnan(c) && c == prev) id(stable_setpoint) = c;
+                  prev = c;
+                }
+                id(compressor).publish_state(f[2] & 0x40);
+                id(comfort_icon).publish_state(f[1] & 0x20);
+                id(eco_icon).publish_state(f[1] & 0x40);
+                id(backlight).publish_state(f[1] & 0x08);
+                id(pool_waiting).publish_state(f[2] & 0x04);
+                id(param_menu).publish_state(f[2] & 0x02);
+                id(installer_menu).publish_state((f[2] & 0x03) == 0x03);
+                // raw frame, only when it changes (pool blinking and XOR masked; backlight kept, to see the real frame)
+                static uint8_t last[8] = {0};
+                uint8_t m[8];
+                memcpy(m, f, 8);
+                m[2] &= ~0x04; m[7] = 0;
+                if (ciat::nav::survey().filter_active()) memset(m + 3, 0, 4);  // measurement shown: digits ignored
+                if (memcmp(m, last, 8)) {
+                  memcpy(last, m, 8);
+                  id(hp_frame).publish_state(ciat::hex(f, 8));
+                  ESP_LOGI("ciat", "12.2 %s  display=[%s]", ciat::hex(f, 8).c_str(), txt.c_str());
+                }
+                break;
+              }
+              case 0xAC: {  // 12.1 terminal -> heat pump: mode, dial, keys, room temperature
+                id(n_terminal)++;
+                if (ciat::bcd_ok(f[3]) && (f[4] & 0x0F) <= 9) {
+                  float room = ciat::bcd(f[3]) + (f[4] & 0x0F) / 10.0f;
+                  if (std::isnan(id(terminal_room_temp).state) || id(terminal_room_temp).state != room)
+                    id(terminal_room_temp).publish_state(room);
+                }
+                float qf = f[4] >> 4;  // always F (15) so far; sign or validity? (protocol.md, O12)
+                if (std::isnan(id(fd_nibble).state) || id(fd_nibble).state != qf) id(fd_nibble).publish_state(qf);
+                std::string dl = ciat::dial_name(f[2]), md = ciat::mode_name(f[1]), ks = ciat::keys_text(f[2]);
+                {
+                  std::string ap;
+                  if (ciat::press().terminal(f[2], millis(), ap)) {
+                    id(last_press).publish_state(ap);
+                    ESP_LOGW("ciat", "press: %s", ap.c_str());
+                  }
+                }
+                if (!id(dial).has_state() || id(dial).state != dl) id(dial).publish_state(dl);
+                if (!id(terminal_mode).has_state() || id(terminal_mode).state != md) id(terminal_mode).publish_state(md);
+                if (!id(keys).has_state() || id(keys).state != ks) id(keys).publish_state(ks);
+                static uint8_t last[7] = {0};
+                if (memcmp(f, last, 7)) {
+                  memcpy(last, f, 7);
+                  id(terminal_frame).publish_state(ciat::hex(f, 7));
+                  ESP_LOGI("ciat", "12.1 %s  dial=%s keys=%s mode=%s", ciat::hex(f, 7).c_str(), dl.c_str(), ks.c_str(), md.c_str());
+                }
+                break;
+              }
+              case 0xAE: {  // 12.1 variant (bit 0x02 of the header): not decoded, only recorded with its context
+                id(n_ae)++;
+                id(ae_frames).publish_state(id(n_ae));
+                auto &p = ciat::parser();
+                id(ae_text) = ciat::hex(f, 7) +
+                    " | 12.1 before " + (p.has_ref[0] ? ciat::hex(p.ref[0], 7) : std::string("?")) +
+                    " | heat pump before " + (p.has_ref[1] ? ciat::hex(p.ref[1], 8) : std::string("?"));
+                ESP_LOGW("ciat", "AE frame received: %s", id(ae_text).c_str());
+                break;
+              }
+              case 0xEE: {  // 14.1 terminal -> heat pump: clock
+                std::string h = ciat::clock_text(f);
+                if (!id(terminal_clock).has_state() || id(terminal_clock).state != h) {
+                  id(terminal_clock).publish_state(h);
+                  ESP_LOGI("ciat", "14.1 %s  clock=%s", ciat::hex(f, 5).c_str(), h.c_str());
+                }
+                break;
+              }
+              default:  // requests 14 14 / 12 12: nothing to publish
+                break;
+            }
+          }
+
+  # Surveyed settings: saved in flash when one of them changed (actual write at the preferences sync, at most once a
+  # minute; ciat_flash.h).
+  - interval: 30s
+    then:
+      - lambda: |-
+          auto &r = ciat::nav::survey();
+          if (!r.changed) return;
+          if (ciat::flash::save(r)) ESP_LOGI("nav", "settings saved in flash");
+          else ESP_LOGW("nav", "saving the settings in flash: failed");
+
+  # Navigator: safeguards, thermostat requests and automatic scans.
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto &nv = ciat::nav::navigator();
+          auto &l = ciat::link::link();
+          if (nv.busy()) {
+            if (id(last_frame_ms) == 0 || millis() - id(last_frame_ms) > 3000) nv.interrupt("silent bus");
+            else if (!l.active()) nv.interrupt("transmission inactive");
+          }
+          std::string st = nv.state_text();
+          if (!id(nav_state).has_state() || id(nav_state).state != st) id(nav_state).publish_state(st);
+          // "Rescue mode" turns itself off after 30 min.
+          if (id(sw_rescue).state && millis() - id(t_rescue) > 30UL * 60UL * 1000UL) id(sw_rescue).turn_off();
+          // Menu left open while the navigator does nothing (reboot in the middle of a scan, abort): leave it at once,
+          // to get the normal display back (setpoint, preset). Not in rescue mode (manual navigation).
+          {
+            static uint32_t t_menu = 0;
+            bool menu_alone = id(param_menu).state && !nv.busy() && l.active() && !id(sw_rescue).state;
+            if (!menu_alone) t_menu = 0;
+            else if (t_menu == 0) t_menu = millis();
+            else if (millis() - t_menu > 3000) {  // 3 s: let a scan that has just finished go by
+              std::string e;
+              if (nv.exit_menu(e)) ESP_LOGW("nav", "menu left open: leaving it");
+              t_menu = 0;
+            }
+          }
+          // Thermostat: a pending request interrupts a scan (clean exit from the menu, ~3 s), never a write.
+          bool request = id(requested_dial) != 0 || !std::isnan(id(requested_setpoint));
+          if (request && nv.busy() && nv.stop_scan()) ESP_LOGW("clim", "scan interrupted for the thermostat");
+          if (nv.take_interruption() && id(slow_scan_running)) id(slow_scan_due) = true;  // to be redone later
+          if (!nv.busy()) id(slow_scan_running) = false;
+          // Thermostat: pending requests (dial, then setpoint), only with the navigator free and transmission active.
+          // They go before the automatic scans. The dial is never changed while the menu is open.
+          if (!nv.busy() && l.active() && !id(param_menu).state) {
+            static const char *const NAMES[] = {"", "clock", "cooling programme", "cooling", "off", "frost protection",
+                                                "heating", "heating programme", "pool"};
+            uint8_t rd = id(requested_dial);
+            if (rd >= 1 && rd <= 8) {
+              id(requested_dial) = 0;
+              auto im0 = id(sel_dial).active_index();
+              if (!im0.has_value() || *im0 + 1 != rd) {
+                id(sel_dial).make_call().set_option(NAMES[rd]).perform();
+                id(t_dial) = millis();
+                id(stable_setpoint) = NAN;  // the display is about to change: setpoint to be read again
+                ESP_LOGW("clim", "dial -> %s", NAMES[rd]);
+              }
+              return;
+            }
+            float rs = id(requested_setpoint);
+            if (!std::isnan(rs)) {
+              if (millis() - id(t_dial) < 4000) return;  // let the heat pump show the new mode's setpoint
+              auto im1 = id(sel_dial).active_index();
+              std::string err;
+              uint8_t sd = id(setpoint_dial);
+              if (!im1.has_value() || *im1 + 1 != sd)
+                err = sd == 8 ? "pool setpoint adjustable only with the dial on pool"
+                              : "setpoint adjustable only with the dial on heating";
+              else if (!std::isnan(id(stable_setpoint)) && std::fabs(id(stable_setpoint) - rs) < 0.05f) err = "";
+              else if (sd == 8)
+                nv.setpoint(rs, ciat::nav::Navigator::POOL_SETPOINT_MIN, ciat::nav::Navigator::POOL_SETPOINT_MAX, err);
+              else nv.setpoint(rs, err);
+              id(requested_setpoint) = NAN;  // a single attempt: no automatic retry
+              if (!err.empty()) {
+                id(nav_error).publish_state(std::string("setpoint: ") + err);
+                ESP_LOGW("clim", "setpoint %.1f refused: %s", rs, err.c_str());
+              } else {
+                ESP_LOGW("clim", "setpoint -> %.1f", rs);
+              }
+              return;
+            }
+          }
+          // Automatic scans: transmission active, dial on a position that allows the menu, 60 s after boot.
+          if (!id(sw_auto_scan).state || nv.busy() || !l.active() || millis() < 60000) return;
+          if (id(requested_dial) != 0 || !std::isnan(id(requested_setpoint))) return;
+          auto im = id(sel_dial).active_index();
+          uint8_t m = im.has_value() ? *im + 1 : 0;
+          if (!ciat::nav::dial_allows_menu(m)) return;
+          std::string err;
+          uint32_t period = (uint32_t) id(nb_scan_period).state * 60000UL;
+          bool fast_due = id(t_fast_scan) == 0 || millis() - id(t_fast_scan) >= period;
+          bool slow_due = id(slow_scan_due) || millis() - id(t_slow_scan) >= 24UL * 3600UL * 1000UL;
+          if (fast_due) {
+            if (nv.scan(ciat::nav::fast_list(m == 8), err)) id(t_fast_scan) = millis();
+          } else if (slow_due) {
+            if (nv.scan(ciat::nav::slow_list(), err)) {
+              id(t_slow_scan) = millis();
+              id(slow_scan_due) = false;
+              id(slow_scan_running) = true;
+            }
+          }
+          if (!err.empty()) id(nav_error).publish_state(err);
+
+  # "Heating" thermostat: state published from what the heat pump actually displays (not from the request).
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto *c = id(heating_climate);
+          auto im = id(sel_dial).active_index();
+          uint8_t m = im.has_value() ? *im + 1 : 0;
+          climate::ClimateMode mode = (m == 5 || m == 6 || m == 7) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_OFF;
+          climate::ClimatePreset pr = climate::CLIMATE_PRESET_NONE;
+          if (m == 5) pr = climate::CLIMATE_PRESET_AWAY;
+          else if (m == 6 || m == 7) {
+            if (id(comfort_icon).state) pr = climate::CLIMATE_PRESET_COMFORT;   // comfort pictogram (p1 0x20)
+            else if (id(eco_icon).state) pr = climate::CLIMATE_PRESET_ECO;      // eco pictogram (p1 0x40)
+            else {
+              auto is = id(sel_slot).active_index();
+              pr = (is.has_value() && *is == 0) ? climate::CLIMATE_PRESET_COMFORT : climate::CLIMATE_PRESET_ECO;
+            }
+          }
+          climate::ClimateAction ac = mode == climate::CLIMATE_MODE_OFF ? climate::CLIMATE_ACTION_OFF
+                                      : id(compressor).state             ? climate::CLIMATE_ACTION_HEATING
+                                                                         : climate::CLIMATE_ACTION_IDLE;
+          // Setpoint: only with the dial on frost protection, heating or heating programme; otherwise (pool, off) the
+          // last one known, so that this thermostat never shows the pool setpoint.
+          float tc = (m == 5 || m == 6 || m == 7) ? id(stable_setpoint) : c->target_temperature;
+          bool pr_change = pr == climate::CLIMATE_PRESET_NONE ? c->preset.has_value()
+                                                               : (!c->preset.has_value() || *c->preset != pr);
+          // Unknown setpoint (just after a dial change): published empty rather than the old value, which no longer
+          // belongs to the new mode.
+          bool tc_change = std::isnan(tc) ? !std::isnan(c->target_temperature) : c->target_temperature != tc;
+          bool change = c->mode != mode || c->action != ac || pr_change || tc_change;
+          if (!change) return;
+          c->mode = mode;
+          c->action = ac;
+          if (pr == climate::CLIMATE_PRESET_NONE) c->preset.reset();
+          else c->preset = pr;
+          c->target_temperature = tc;
+          c->publish_state();
+
+  # "Pool" thermostat: state read from the heat pump (dial, displayed setpoint, compressor).
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto *c = id(pool_climate);
+          auto im = id(sel_dial).active_index();
+          bool pool = im.has_value() && *im + 1 == 8;
+          climate::ClimateMode mode = pool ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_OFF;
+          climate::ClimateAction ac = !pool ? climate::CLIMATE_ACTION_OFF
+                                      : id(compressor).state ? climate::CLIMATE_ACTION_HEATING
+                                                             : climate::CLIMATE_ACTION_IDLE;
+          float tc = pool ? id(stable_setpoint) : c->target_temperature;  // outside pool: last setpoint known
+          bool tc_change = std::isnan(tc) ? !std::isnan(c->target_temperature) : c->target_temperature != tc;
+          if (c->mode == mode && c->action == ac && !tc_change) return;
+          c->mode = mode;
+          c->action = ac;
+          c->target_temperature = tc;
+          c->publish_state();
+
+  # Transmission resumed at boot if it was on before: after listening to the bus for 20 s, and only if no other
+  # terminal answered (terminal plugged back to go back) and the heat pump is talking.
+  - interval: 1s
+    then:
+      - lambda: |-
+          static bool done = false;
+          if (done || millis() < 20000) return;
+          done = true;
+          auto &l = ciat::link::link();
+          if (!id(tx_wanted) || !l.tx_compiled()) return;
+          if (l.terminal_present()) {
+            ESP_LOGW("ciat", "boot: another terminal answers on the bus, transmission left off");
+            return;
+          }
+          if (id(last_frame_ms) == 0 || millis() - id(last_frame_ms) > 3000) {
+            ESP_LOGW("ciat", "boot: silent bus, transmission left off");
+            return;
+          }
+          l.allow(true);
+          ESP_LOGW("ciat", "boot: transmission resumed (it was on before the reboot)");
+
+  # Automatic resume after an inhibition: 30 s later, if transmission is wanted and no other terminal is seen; at most
+  # 3 resumes per hour, then it stays off.
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto &l = ciat::link::link();
+          static uint32_t resumes[3] = {0, 0, 0};
+          if (!id(tx_wanted) || !l.inhibition() || !l.allowed()) return;
+          if (esp_timer_get_time() - l.t_inhibition() < 30LL * 1000 * 1000) return;
+          if (l.terminal_present()) return;
+          uint32_t now = millis();
+          int n = 0;
+          for (auto t : resumes) if (t && now - t < 3600UL * 1000UL) n++;
+          if (n >= 3) {
+            static uint32_t log_t = 0;
+            if (now - log_t > 600000 || log_t == 0) { log_t = now; ESP_LOGW("ciat", "3 resumes within 1 h: transmission left off"); }
+            return;
+          }
+          ESP_LOGW("ciat", "inhibition (%s): transmission resumed automatically", ciat::link::inhibition_name(l.inhibition()));
+          resumes[0] = resumes[1]; resumes[1] = resumes[2]; resumes[2] = now;
+          l.allow(true);
+
+  # Last anomaly on the bus (diagnostic of inhibitions).
+  - interval: 1s
+    then:
+      - lambda: |-
+          static uint32_t seen = 0;
+          auto a = ciat::link::link().anomaly();
+          if (a.no == seen) return;
+          seen = a.no;
+          static const char *const T[] = {"", "foreign frame", "wrong echo", "missing echo"};
+          char t[220];
+          snprintf(t, sizeof t, "%s %s: %s, %.1f ms after the request, echo %s, sent %s",
+                   id(ha_time).now().strftime("%d/%m %H:%M:%S").c_str(), T[a.type < 4 ? a.type : 0], ciat::hex(a.b, a.n).c_str(),
+                   a.delay_us / 1000.0f, a.expected ? "expected" : "not expected", ciat::hex(a.tx, a.tx_n).c_str());
+          id(bus_anomaly).publish_state(t);
+          ESP_LOGW("ciat", "anomaly: %s", t);
+
+  # Bus active: false after 5 s without a valid frame (other entities otherwise keep their last value).
+  - interval: 1s
+    then:
+      - lambda: |-
+          id(bus_active).publish_state(id(last_frame_ms) != 0 && millis() - id(last_frame_ms) < 5000);
+
+  # Statistics per minute.
+  - interval: 60s
+    then:
+      - lambda: |-
+          static uint32_t ok0 = 0, bad0 = 0, hp0 = 0, ter0 = 0;
+          id(valid_frames).publish_state(ciat::parser().ok - ok0);
+          id(rejected_bytes).publish_state(ciat::parser().bad - bad0);
+          id(hp_frames_min).publish_state(id(n_hp) - hp0);
+          id(terminal_frames_min).publish_state(id(n_terminal) - ter0);
+          ok0 = ciat::parser().ok; bad0 = ciat::parser().bad; hp0 = id(n_hp); ter0 = id(n_terminal);
+
+  # Command of the virtual terminal, passed on to the bus task.
+  - interval: 200ms
+    then:
+      - lambda: |-
+          ciat::emu::Command c;
+          auto im = id(sel_dial).active_index();
+          c.dial = im.has_value() ? *im + 1 : 5;
+          auto is = id(sel_slot).active_index();
+          c.slot = (is.has_value() && *is == 0) ? 1 : 2;
+          // Room temperature: the last valid value is used with no time limit if Home Assistant or the sensor
+          // disappears, and it is kept in flash (reboot without HA). Without a room temperature the 12.1 cannot be
+          // built and the emulator would stay silent: the heat pump would not restart after a power cut.
+          float x = id(room_ha).state;
+          if (!std::isnan(x) && x > -20.0f && x < 50.0f) {
+            float &sv = id(saved_room_temp);
+            if (std::isnan(sv) || std::fabs(sv - x) >= 0.1f) sv = x;  // flash write grouped by ESPHome (1 min)
+          }
+          c.room_temp = id(saved_room_temp);
+          auto now = id(ha_time).now();
+          if (now.is_valid()) {
+            c.clock_ok = true;
+            c.day = now.day_of_week == 1 ? 7 : now.day_of_week - 1;  // ESPHome: 1 = Sunday; bus: 1 = Monday
+            c.hour = now.hour;
+            c.minute = now.minute;
+          }
+          ciat::link::link().command(c);
+
+  # Emulator state and the 12.1 it would send.
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto &l = ciat::link::link();
+          std::string s;
+          if (!l.tx_compiled()) s = "shadow: transmission not compiled";
+          else if (l.inhibition()) s = std::string("inhibited: ") + ciat::link::inhibition_name(l.inhibition());
+          else if (l.allowed()) s = "transmission active";
+          else s = "ready, transmission off";
+          if (l.terminal_present()) s += " (real terminal present)";
+          if (std::isnan(id(room_ha).state) && !std::isnan(id(saved_room_temp)))
+            s += " (room temperature frozen: HA or sensor missing)";
+          if (!id(emulator_state).has_state() || id(emulator_state).state != s) id(emulator_state).publish_state(s);
+          uint8_t p[7];
+          std::string t = l.predicted_121(p) ? ciat::hex(p, 7) : std::string("none (room temperature unknown)");
+          if (!id(predicted_frame).has_state() || id(predicted_frame).state != t) id(predicted_frame).publish_state(t);
+
+  # Measurements from the bus task, per minute.
+  - interval: 60s
+    then:
+      - lambda: |-
+          auto s = ciat::link::link().take_stats();
+          if (s.delay_n) {
+            id(delay_min).publish_state(s.delay_min / 1000.0f);
+            id(delay_avg).publish_state(s.delay_sum / (float) s.delay_n / 1000.0f);
+            id(delay_max).publish_state(s.delay_max / 1000.0f);
+          }
+          if (s.edge_n) {
+            id(edge_delay_min).publish_state(s.edge_min / 1000.0f);
+            id(edge_delay_avg).publish_state(s.edge_sum / (float) s.edge_n / 1000.0f);
+            id(edge_delay_max).publish_state(s.edge_max / 1000.0f);
+          }
+          if (s.read_n) {
+            id(read_delay_avg).publish_state(s.read_sum / (float) s.read_n / 1000.0f);
+            id(read_delay_max).publish_state(s.read_max / 1000.0f);
+          }
+          id(bursts_no_edge_min).publish_state(s.no_edge);
+          id(answers_min).publish_state(s.sent);
+          id(bad_echoes_min).publish_state(s.echo_bad);
+          id(too_late_min).publish_state(s.too_late);
+          id(shadow_diffs_min).publish_state(s.shadow_diffs);
+          id(shadow_checked_min).publish_state(s.shadow_n);
+          if (s.shadow_diffs) {
+            char t[40];
+            snprintf(t, sizeof t, " | mask %02X, expected code %u", s.shadow_last, s.shadow_code);
+            std::string e = ciat::hex(s.shadow_frame, 7) + t;
+            id(shadow_last).publish_state(e);
+            ESP_LOGW("ciat", "shadow: difference %s", e.c_str());
+          }
+
+# Reason of the last reboot: tells a power cut from a crash.
+debug:
+  update_interval: 60s
+
+sensor:
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+    update_interval: 60s
+  # Parameters read (navigator, or passive survey when someone views them on the terminal)
+  - platform: template
+    id: p40
+    name: P40 Return water
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p41
+    name: P41 Flow water
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p42
+    name: P42 Computed water setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p43
+    name: P43 Corrected stage differential
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p44
+    name: P44 Outdoor coil refrigerant
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p45
+    name: P45 Exchanger refrigerant
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p46
+    name: P46 Anti-short-cycle timer
+    unit_of_measurement: s   # shown by the heat pump as minutes.seconds, converted to seconds
+    device_class: duration
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: p47
+    name: P47 Remaining frosting time
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: p48
+    name: P48 Outdoor temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: p49
+    name: P49 Fault resets
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: p50
+    name: P50 Pool temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: homeassistant
+    id: room_ha
+    entity_id: ${room_sensor}
+    internal: true
+  - platform: template
+    id: delay_min
+    name: Terminal answer delay min
+    unit_of_measurement: ms
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: delay_avg
+    name: Terminal answer delay average
+    unit_of_measurement: ms
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: delay_max
+    name: Terminal answer delay max
+    unit_of_measurement: ms
+    accuracy_decimals: 2
+    entity_category: diagnostic
+  # Delays measured between edges (GPIO interrupt): the ones to compare with an oscilloscope (10.2-11.2 ms).
+    update_interval: never
+  - platform: template
+    id: edge_delay_min
+    name: Terminal answer delay min (edge)
+    unit_of_measurement: ms
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: edge_delay_avg
+    name: Terminal answer delay average (edge)
+    unit_of_measurement: ms
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: edge_delay_max
+    name: Terminal answer delay max (edge)
+    unit_of_measurement: ms
+    accuracy_decimals: 3
+    entity_category: diagnostic
+  # From the first edge of a burst to the task reading its first byte (1.04 ms byte included).
+    update_interval: never
+  - platform: template
+    id: read_delay_avg
+    name: Task read delay average
+    unit_of_measurement: ms
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: read_delay_max
+    name: Task read delay max
+    unit_of_measurement: ms
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: bursts_no_edge_min
+    name: Bursts without edge per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: distinct_hp_frames
+    name: Distinct heat-pump frames since boot
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: single_cycle_hp_frames
+    name: Single-cycle heat-pump frames since boot
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: answers_min
+    name: Answers sent per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: bad_echoes_min
+    name: Wrong echoes per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: too_late_min
+    name: Dropped answers per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: shadow_checked_min
+    name: Shadow 12.1 checked per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: shadow_diffs_min
+    name: Shadow differences per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: displayed_setpoint
+    name: Displayed setpoint
+    entity_category: diagnostic
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: fd_nibble
+    name: Fd high nibble
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: terminal_room_temp
+    name: Terminal room temperature
+    entity_category: diagnostic
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: valid_frames
+    name: Valid frames per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: rejected_bytes
+    name: Rejected bytes per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: hp_frames_min
+    name: Heat-pump frames per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: terminal_frames_min
+    name: Terminal frames per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: ae_frames
+    name: AE frames since boot
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: Last reboot reason
+      entity_category: diagnostic
+  # Navigator
+  - platform: template
+    id: nav_state
+    name: Navigator state
+    entity_category: diagnostic
+  - platform: template
+    id: nav_error
+    name: Navigator last error
+    entity_category: diagnostic
+  - platform: template
+    id: nav_last_scan
+    name: Navigator last scan
+    entity_category: diagnostic
+  - platform: template
+    id: nav_last_write
+    name: Navigator last write
+    entity_category: diagnostic
+  - platform: template
+    id: settings_1
+    name: Settings P00 to P29
+    entity_category: diagnostic
+  - platform: template
+    id: settings_2
+    name: Settings P30 to P99
+    entity_category: diagnostic
+  - platform: template
+    id: emulator_state
+    name: Emulator state
+    entity_category: diagnostic
+  - platform: template
+    id: predicted_frame
+    name: 12.1 the emulator would send
+    entity_category: diagnostic
+  - platform: template
+    id: shadow_last
+    name: Shadow last difference
+    entity_category: diagnostic
+  - platform: template
+    id: display_text
+    name: Display
+  - platform: template
+    id: dial
+    name: Dial
+    entity_category: diagnostic
+  - platform: template
+    id: terminal_mode
+    name: Mode requested by the terminal
+    entity_category: diagnostic
+  - platform: template
+    id: keys
+    name: Keys
+    entity_category: diagnostic
+  - platform: template
+    id: terminal_clock
+    name: Terminal clock
+    entity_category: diagnostic
+  - platform: template
+    id: hp_frame
+    name: Raw heat-pump frame
+    entity_category: diagnostic
+  - platform: template
+    id: terminal_frame
+    name: Raw terminal frame
+    entity_category: diagnostic
+  - platform: template
+    id: bus_anomaly
+    name: Last bus anomaly
+    entity_category: diagnostic
+  - platform: template
+    id: last_reject
+    name: Last rejected bytes
+    entity_category: diagnostic
+  - platform: template
+    id: ae_frame
+    name: Last AE frame
+    entity_category: diagnostic
+  - platform: template
+    id: new_hp_frame
+    name: New heat-pump frame
+    entity_category: diagnostic
+  - platform: template
+    id: single_cycle_hp_frame
+    name: Single-cycle heat-pump frame
+    entity_category: diagnostic
+  - platform: template
+    id: last_press
+    name: Last key press
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: bus_active
+    name: Bus active
+    device_class: connectivity
+  - platform: template
+    id: compressor
+    name: Compressor
+    device_class: running
+  - platform: template
+    id: comfort_icon
+    name: Comfort pictogram
+    entity_category: diagnostic
+  - platform: template
+    id: eco_icon
+    name: Eco pictogram
+    entity_category: diagnostic
+  - platform: template
+    id: backlight
+    name: Backlight
+    entity_category: diagnostic
+  - platform: template
+    id: pool_waiting
+    name: Waiting for pool contact
+    filters:
+      - delayed_off: 3s   # the bit blinks every 0.9 s: smoothed
+  - platform: template
+    id: param_menu
+    name: Parameter menu
+    entity_category: diagnostic
+  - platform: template
+    id: installer_menu
+    name: Installer menu
+    entity_category: diagnostic
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# Thermostats for Home Assistant. ESPHome "template" platform: HA requests are queued (globals) and applied by the
+# navigator loop; the state shown always comes from the heat pump.
+#   modes:    heat = dial on heating; off = dial on off;
+#   presets:  comfort / eco = dial on heating + programme slot; away = dial on frost protection;
+#   setpoint: adjusted outside the menu with + and −, dial on heating only, 15 to 30 °C by 0.5;
+#   action:   heating while the compressor runs.
+climate:
+  - platform: template
+    id: heating_climate
+    name: Heating
+    sensor: room_ha                # the room temperature sent to the heat pump
+    supports_action: true
+    supported_modes: [HEAT, "OFF"]
+    supported_presets: [COMFORT, ECO, AWAY]
+    optimistic: false              # the state only changes when the heat pump displays it
+    restore_mode: NO_RESTORE
+    visual:
+      min_temperature: 15
+      max_temperature: 30
+      temperature_step:
+        target_temperature: 0.5
+        current_temperature: 0.1
+    # A request that changes nothing (dial already in the right position) is not queued: it would interrupt a scan
+    # for nothing (a scheduler may apply the same preset again).
+    set_mode_action:
+      - lambda: |-
+          uint8_t wanted = (x == climate::CLIMATE_MODE_OFF) ? 4 : 6;
+          auto im = id(sel_dial).active_index();
+          if (!im.has_value() || *im + 1 != wanted) id(requested_dial) = wanted;
+    set_preset_action:
+      - lambda: |-
+          if (x != climate::CLIMATE_PRESET_AWAY && x != climate::CLIMATE_PRESET_COMFORT && x != climate::CLIMATE_PRESET_ECO) return;
+          uint8_t wanted = x == climate::CLIMATE_PRESET_AWAY ? 5 : 6;
+          auto im = id(sel_dial).active_index();
+          if (!im.has_value() || *im + 1 != wanted) id(requested_dial) = wanted;
+          if (wanted == 6) {
+            const char *slot = x == climate::CLIMATE_PRESET_COMFORT ? "comfort" : "eco";
+            auto is = id(sel_slot).active_index();
+            bool already = is.has_value() && (*is == 0) == (x == climate::CLIMATE_PRESET_COMFORT);
+            if (!already) id(sel_slot).make_call().set_option(slot).perform();
+          }
+    set_target_temperature_action:
+      - lambda: |-
+          float v = std::round(x * 2.0f) / 2.0f;
+          if (std::isnan(id(stable_setpoint)) || std::fabs(id(stable_setpoint) - v) > 0.05f) {
+            id(requested_setpoint) = v;
+            id(setpoint_dial) = 6;
+          }
+
+  # Pool (summer): heat = dial on pool, off = dial on off. The heat pump then heats only while the pool contact is
+  # closed (wired by the installer, typically in series with the pool pump).
+  # Pool setpoint adjusted outside the menu with + and −, assumed limits 20-35 (range of P23); temperature: P50.
+  - platform: template
+    id: pool_climate
+    name: Pool
+    sensor: p50
+    supports_action: true
+    supported_modes: [HEAT, "OFF"]
+    optimistic: false
+    restore_mode: NO_RESTORE
+    visual:
+      min_temperature: 20
+      max_temperature: 35
+      temperature_step:
+        target_temperature: 0.5
+        current_temperature: 0.1
+    set_mode_action:
+      - lambda: |-
+          auto im = id(sel_dial).active_index();
+          uint8_t m = im.has_value() ? *im + 1 : 0;
+          if (x == climate::CLIMATE_MODE_HEAT) { if (m != 8) id(requested_dial) = 8; }
+          else if (m == 8) id(requested_dial) = 4;   // pool off: dial on off
+    set_target_temperature_action:
+      - lambda: |-
+          float v = std::round(x * 2.0f) / 2.0f;
+          auto im = id(sel_dial).active_index();
+          bool already = im.has_value() && *im + 1 == 8 && !std::isnan(id(stable_setpoint)) &&
+                         std::fabs(id(stable_setpoint) - v) < 0.05f;
+          if (!already) { id(requested_setpoint) = v; id(setpoint_dial) = 8; }
+
+select:
+  - platform: template
+    id: sel_dial
+    name: Virtual dial
+    internal: true   # driven by the thermostats (Heating, Pool)
+    options: [clock, cooling programme, cooling, "off", frost protection, heating, heating programme, pool]   # order = codes 1 to 8
+    initial_option: frost protection
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: sel_slot
+    name: Programme slot
+    internal: true   # driven by the Heating thermostat
+    options: [comfort, eco]   # used only when the heat pump is in programme mode (dial on heating)
+    initial_option: eco
+    optimistic: true
+    restore_value: true
+
+number:
+  - platform: template
+    id: nb_scan_period
+    name: Measurement scan period
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    entity_category: config
+  - platform: template
+    id: nb_param
+    name: Parameter to write
+    min_value: 0
+    max_value: 99
+    step: 1
+    initial_value: 0
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: nb_value
+    name: Value to write
+    min_value: -20
+    max_value: 90
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    entity_category: config
+
+button:
+  # Low-level commands: only with "Rescue mode" on. The navigator refuses (error published) if transmission is off.
+  - platform: template
+    name: Scan the measurements
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          std::string err;
+          if (!ciat::link::link().active()) err = "transmission inactive (shadow mode): scan refused";
+          else {
+            auto im = id(sel_dial).active_index();
+            bool pool = im.has_value() && *im + 1 == 8;
+            if (ciat::nav::navigator().scan(ciat::nav::fast_list(pool), err)) id(t_fast_scan) = millis();
+          }
+          if (!err.empty()) id(nav_error).publish_state(err);
+  - platform: template
+    name: Scan the settings
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          std::string err;
+          if (!ciat::link::link().active()) err = "transmission inactive (shadow mode): scan refused";
+          else if (ciat::nav::navigator().scan(ciat::nav::slow_list(), err)) {
+            id(t_slow_scan) = millis();
+            id(slow_scan_due) = false;
+          }
+          if (!err.empty()) id(nav_error).publish_state(err);
+  - platform: template
+    name: Write the parameter
+    entity_category: config
+    on_press:
+      - lambda: |-
+          std::string err;
+          auto im = id(sel_dial).active_index();
+          uint8_t m = im.has_value() ? *im + 1 : 0;
+          if (!id(sw_rescue).state) err = "rescue mode off: write refused";
+          else if (!ciat::link::link().active()) err = "transmission inactive (shadow mode): write refused";
+          else if (!ciat::nav::dial_allows_menu(m)) err = "dial on a position without a menu";
+          else ciat::nav::navigator().write((int) id(nb_param).state, id(nb_value).state, err);
+          if (!err.empty()) id(nav_error).publish_state(err);
+  - platform: template
+    name: Reset the navigator
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          ciat::nav::navigator().reset();
+  # Number of 12.1 frames carrying the key: 3 for + and − (outside the menu the heat pump takes no fewer; in the menu
+  # it is still a single step), 2 for OK, 18 for a long press (menu entry and exit).
+  - platform: template
+    name: Key plus
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          ciat::link::link().press(0x01, 3);
+  - platform: template
+    name: Key minus
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          ciat::link::link().press(0x02, 3);
+  - platform: template
+    name: Key OK
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          ciat::link::link().press(0x04, 2);
+  - platform: template
+    name: Enter the parameter menu (long + and OK)
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          ciat::link::link().press(0x05, 18);
+  - platform: template
+    name: Long OK (leave the menu)
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!id(sw_rescue).state) { id(nav_error).publish_state("rescue mode off: command ignored"); ESP_LOGW("ciat", "rescue mode off: command ignored"); return; }
+          ciat::link::link().press(0x04, 18);
+
+switch:
+  - platform: template
+    id: sw_auto_scan
+    name: Automatic scan
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: sw_rescue
+    # Rescue mode: gives access to the low-level commands (keys, menu, parameter write, manual scans, navigator reset).
+    # Off at boot, it turns itself off after 30 min.
+    name: Rescue mode
+    icon: mdi:lifebuoy
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: id(t_rescue) = millis();
+  # Resumed at boot if it was on (see the resume interval). Turning it on again re-arms an inhibition.
+  # No effect if tx_compiled = "false".
+  - platform: template
+    id: sw_tx
+    name: Bus transmission
+    entity_category: config
+    # DISABLED: at boot ESPHome does not call turn_off_action (ALWAYS_OFF did, and cleared tx_wanted);
+    # the resume is decided by the boot resume interval.
+    restore_mode: DISABLED
+    lambda: return ciat::link::link().active();
+    turn_on_action:
+      - lambda: |-
+          if (!ciat::link::link().tx_compiled()) ESP_LOGW("ciat", "transmission not compiled: switch has no effect");
+          id(tx_wanted) = true;
+          ciat::link::link().allow(true);
+    turn_off_action:
+      - lambda: |-
+          id(tx_wanted) = false;
+          ciat::link::link().allow(false);

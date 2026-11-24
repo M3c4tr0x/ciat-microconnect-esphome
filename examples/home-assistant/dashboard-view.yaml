@@ -1,0 +1,220 @@
+# Example Home Assistant view for the CIAT emulator ("sections" view, built-in cards only, except the optional
+# weekly schedule card at the end). Paste it in: dashboard → pencil → ⋮ of a view → Edit in YAML.
+# Entity IDs assume the default names (device "CIAT heat pump").
+title: Heat pump
+path: heat-pump
+icon: mdi:heat-pump
+type: sections
+max_columns: 3
+badges:
+  - type: entity
+    entity: binary_sensor.ciat_heat_pump_bus_active
+    show_name: true
+  - type: entity
+    entity: sensor.ciat_heat_pump_emulator_state
+    name: Emulator
+    show_name: true
+  - type: entity
+    entity: binary_sensor.ciat_heat_pump_compressor
+    show_name: true
+  - type: entity
+    entity: sensor.ciat_heat_pump_p48_outdoor_temperature
+    name: Outdoor
+    show_name: true
+sections:
+  - type: grid
+    cards:
+      - type: heading
+        heading: Control
+        icon: mdi:thermostat
+      - type: tile
+        entity: climate.ciat_heat_pump_heating
+        name: Heating
+        state_content: [preset_mode, hvac_action, current_temperature]
+        features:
+          - type: target-temperature
+          - type: climate-preset-modes
+            style: icons
+            preset_modes: [comfort, eco, away]
+          - type: climate-hvac-modes
+            hvac_modes: [heat, "off"]
+        grid_options:
+          columns: 12
+          rows: 4
+      - type: tile
+        entity: climate.ciat_heat_pump_pool
+        name: Pool
+        state_content: [hvac_action, current_temperature]
+        features:
+          - type: target-temperature
+          - type: climate-hvac-modes
+            hvac_modes: [heat, "off"]
+        grid_options:
+          columns: 12
+          rows: 3
+      - type: tile
+        entity: binary_sensor.ciat_heat_pump_waiting_for_pool_contact
+        name: Pool contact
+        icon: mdi:pool
+        grid_options:
+          columns: 12
+  - type: grid
+    cards:
+      - type: heading
+        heading: Measurements
+        icon: mdi:heat-pump-outline
+        badges:
+          - type: entity
+            entity: sensor.ciat_heat_pump_navigator_last_scan
+      - type: tile
+        entity: sensor.ciat_heat_pump_display
+        name: Display
+        icon: mdi:numeric
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_dial
+        name: Dial
+        icon: mdi:knob
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p41_flow_water
+        name: Flow water
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p40_return_water
+        name: Return water
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p42_computed_water_setpoint
+        name: Water setpoint
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p48_outdoor_temperature
+        name: Outdoor
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p44_outdoor_coil_refrigerant
+        name: Outdoor coil
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p45_exchanger_refrigerant
+        name: Exchanger
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p46_anti_short_cycle_timer
+        name: Anti-short-cycle
+        grid_options: {columns: 6}
+      - type: tile
+        entity: sensor.ciat_heat_pump_p47_remaining_frosting_time
+        name: Remaining frosting time
+        grid_options: {columns: 6}
+  - type: grid
+    column_span: 3
+    cards:
+      - type: heading
+        heading: Curves
+        icon: mdi:chart-line
+      - type: history-graph
+        title: Water and outdoor temperatures (24 h)
+        hours_to_show: 24
+        entities:
+          - entity: sensor.ciat_heat_pump_p41_flow_water
+            name: Flow
+          - entity: sensor.ciat_heat_pump_p40_return_water
+            name: Return
+          - entity: sensor.ciat_heat_pump_p42_computed_water_setpoint
+            name: Water setpoint
+          - entity: sensor.ciat_heat_pump_p48_outdoor_temperature
+            name: Outdoor
+        grid_options: {columns: full, rows: 6}
+      - type: history-graph
+        title: Heating and compressor (24 h)
+        hours_to_show: 24
+        entities:
+          - entity: climate.ciat_heat_pump_heating
+            name: Heating
+          - entity: binary_sensor.ciat_heat_pump_compressor
+            name: Compressor
+          - entity: switch.ciat_heat_pump_bus_transmission
+            name: Transmission
+        grid_options: {columns: full, rows: 5}
+  - type: grid
+    cards:
+      - type: heading
+        heading: Emulator
+        icon: mdi:chip
+      - type: tile
+        entity: sensor.ciat_heat_pump_emulator_state
+        name: State
+        grid_options: {columns: 12}
+      - type: tile
+        entity: switch.ciat_heat_pump_bus_transmission
+        name: Transmission
+        grid_options: {columns: 6}
+      - type: tile
+        entity: switch.ciat_heat_pump_automatic_scan
+        name: Automatic scan
+        grid_options: {columns: 6}
+      - type: entities
+        entities:
+          - entity: sensor.ciat_heat_pump_navigator_state
+            name: Navigator
+          - entity: sensor.ciat_heat_pump_last_bus_anomaly
+            name: Last bus anomaly
+          - entity: sensor.ciat_heat_pump_navigator_last_error
+            name: Last error
+          - entity: sensor.ciat_heat_pump_navigator_last_write
+            name: Last write / setpoint
+          - entity: number.ciat_heat_pump_measurement_scan_period
+            name: Measurement scan period
+          - entity: sensor.ciat_heat_pump_wrong_echoes_per_minute
+            name: Wrong echoes per minute
+          - entity: sensor.ciat_heat_pump_last_reboot_reason
+            name: Last reboot reason
+          - entity: sensor.ciat_heat_pump_uptime
+            name: Uptime
+      - type: markdown
+        title: Settings read from the heat pump
+        content: >-
+          **P00 to P29**: {{ states('sensor.ciat_heat_pump_settings_p00_to_p29') }}
+
+
+          **P30 to P99**: {{ states('sensor.ciat_heat_pump_settings_p30_to_p99') }}
+  - type: grid
+    cards:
+      - type: heading
+        heading: Rescue mode
+        icon: mdi:lifebuoy
+      - type: tile
+        entity: switch.ciat_heat_pump_rescue_mode
+        name: Rescue mode (30 min)
+        grid_options: {columns: 12}
+      - type: entities
+        visibility:
+          - condition: state
+            entity: switch.ciat_heat_pump_rescue_mode
+            state: "on"
+        entities:
+          - entity: button.ciat_heat_pump_key_minus
+          - entity: button.ciat_heat_pump_key_ok
+          - entity: button.ciat_heat_pump_key_plus
+          - entity: button.ciat_heat_pump_enter_the_parameter_menu_long_and_ok
+          - entity: button.ciat_heat_pump_long_ok_leave_the_menu
+          - entity: number.ciat_heat_pump_parameter_to_write
+          - entity: number.ciat_heat_pump_value_to_write
+          - entity: button.ciat_heat_pump_write_the_parameter
+          - entity: button.ciat_heat_pump_scan_the_measurements
+          - entity: button.ciat_heat_pump_scan_the_settings
+          - entity: button.ciat_heat_pump_reset_the_navigator
+  # Optional: weekly schedule editor of the "ha-chauffage" integration (see docs/home-assistant.md).
+  - type: grid
+    column_span: 2
+    cards:
+      - type: heading
+        heading: Weekly schedule
+        icon: mdi:calendar-week
+      - type: custom:chauffage-programme-card
+        language: en
+        thermostats:
+          - entity: climate.ciat_heat_pump_heating
+            name: House

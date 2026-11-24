@@ -1,0 +1,20 @@
+# ESPHome
+secrets.yaml
+.esphome/
+.pioenvs/
+.piolibdeps/
+
+# Build outputs
+build/
+*.o
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

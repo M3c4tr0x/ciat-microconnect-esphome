@@ -1,0 +1,49 @@
+# Notifications from the CIAT emulator:
+#   - every bus anomaly (foreign frame, wrong or missing echo), with the full diagnostic;
+#   - transmission off for more than 1 min (the firmware resumes it by itself within 30 s, at most 3 times per hour:
+#     beyond that, or if it was turned off by hand, it stays off).
+# It never turns transmission back on: the firmware does.
+# Entity IDs assume the default names (device "CIAT heat pump"). Replace notify.mobile_app_your_phone.
+alias: CIAT bus notifications
+description: Notifications of bus anomalies and of transmission left off (CIAT emulator).
+mode: queued
+max: 5
+triggers:
+  - trigger: state
+    entity_id: sensor.ciat_heat_pump_last_bus_anomaly
+    id: anomaly
+  - trigger: state
+    entity_id: switch.ciat_heat_pump_bus_transmission
+    to: "off"
+    for:
+      minutes: 1
+    id: tx_off
+conditions:
+  # Ignore transitions through "unavailable" or "unknown" (ESP32 reboot).
+  - condition: template
+    value_template: >-
+      {{ trigger.id != 'anomaly' or
+         (trigger.to_state.state not in ['unknown', 'unavailable', ''] and
+          trigger.from_state is not none and trigger.from_state.state != 'unavailable') }}
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: anomaly
+        sequence:
+          - action: notify.mobile_app_your_phone
+            data:
+              title: "CIAT: bus anomaly"
+              message: >-
+                {{ trigger.to_state.state }} —
+                {{ states('sensor.ciat_heat_pump_emulator_state') }}
+      - conditions:
+          - condition: trigger
+            id: tx_off
+        sequence:
+          - action: notify.mobile_app_your_phone
+            data:
+              title: "CIAT: transmission off"
+              message: >-
+                Transmission off for 1 min ({{ states('sensor.ciat_heat_pump_emulator_state') }}).
+                Automatic resume exhausted (3 per hour) or turned off by hand: turn it back on from HA if needed.
