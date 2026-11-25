@@ -38,7 +38,8 @@ Tested with ESPHome 2026.11 (ESP-IDF framework) on an ESP32-C3 Super Mini.
 | Glue | `ciat-emulator.yaml` | ESPHome entities, thermostats, scans, safeguards |
 
 The pure-logic parts (`ciat_emul.h`, `ciat_nav.h`) are tested on a PC: `tools/test_ciat_emul.cpp` (real frames) and
-`tools/test_ciat_nav.cpp` (a simulator of the heat pump's menu, 46 cases).
+`tools/test_ciat_nav.cpp` (a simulator of the heat pump's menu, 51 cases). The bus task (`ciat_link.h`) is tested
+the same way with stand-ins for the ESP-IDF functions: `tools/test_ciat_link.cpp` (echo checks and inhibitions).
 
 ## 3. Thermostats
 
@@ -81,9 +82,14 @@ The pure-logic parts (`ciat_emul.h`, `ciat_nav.h`) are tested on a PC: `tools/te
 
 ## 4. Measurements and settings
 
-- **Measurement scan** (P40-P48, plus P50 with the dial on pool): every "Measurement scan period" (5 min by
-  default, 2 min works well), at installer level. ~32 s per scan: ~8 s to enter the installer level and ~3 s to
-  leave are imposed by the heat pump. Each value is averaged over 5 cycles (P50: 9).
+- **Measurement scan**, every "Measurement scan period" (5 min by default; 1 to 2 min works well):
+  - at **user level**: P40-P42, P44, P45, P48 (plus P50 with the dial on pool), the measurements visible at that
+    level. ~17 s per scan (~3 s to enter the menu);
+  - at **installer level**, every 10 min instead: the same plus P43, P46 and P47, which are only shown there. ~28 s
+    (~8 s to enter the installer level);
+  - each value is the median of 3 cycles (a one-cycle glitch is rejected); P50, which jumps at every cycle, is
+    averaged over 9.
+  - Values only change in Home Assistant at each scan: curves show steps of one scan period.
 - **Settings scan** (P00-P36, P49, P60-P63, P80-P99): at boot and once a day. Results in "Settings P00 to P29" and
   "Settings P30 to P99", kept in flash.
 - Scans run only with "Automatic scan" on, transmission active, and the dial on a position that allows the menu
@@ -91,6 +97,20 @@ The pure-logic parts (`ciat_emul.h`, `ciat_nav.h`) are tested on a PC: `tools/te
 - The heat pump **keeps regulating while the menu is open**; a slot change arriving during a scan is applied when
   the scan leaves the menu.
 - Passive survey: with the original terminal in listen-only mode, values viewed by hand on its menu are published too.
+
+### Thermal power and energy
+
+- **"Thermal power"** (kW) = 1.163 × Q × (P41 − P40), computed every 10 s, where Q is the **"Water flow rate"**
+  (m³/h, configuration) that **you enter**: the heat pump does not report the flow. 0 disables it.
+- 0 while the compressor is off, and while the supply is colder than the return (defrost: the heat taken back from
+  the water is ignored, so the total is slightly over-estimated). Unknown if P40/P41 have not been read for 3 min.
+- **"Thermal energy"** (kWh, `total_increasing`, kept in flash): its integral, for Home Assistant's long-term
+  statistics (the raw history is purged after a few days).
+- Accuracy: P40 and P41 are read to the tenth, so ±0.1 K on a 3-5 K difference (±2-3 %), plus the error on Q. During
+  the first 2-3 minutes of a compressor cycle, the difference is still building up: the power shown is lower, which
+  is real (the water and the exchanger warm up first).
+- Finding Q: a flow meter (a clamp-on ultrasonic one needs no plumbing), the circulator curve, or the
+  [Home Assistant package](home-assistant.md#6-heat-output-and-cop) that estimates it from the datasheet COP.
 
 ## 5. Safety and robustness
 
@@ -100,7 +120,8 @@ The pure-logic parts (`ciat_emul.h`, `ciat_nav.h`) are tested on a PC: `tools/te
 | Reboot | the "Bus transmission" choice is kept in flash; after 20 s of listening, transmission resumes unless another terminal answers or the bus is silent |
 | Home Assistant or Wi-Fi lost | no reboot (`reboot_timeout: 0s`); answers continue with the last dial, slot and room temperature (kept in flash) |
 | Another terminal on the bus | 3 foreign frames within 10 s → transmission inhibited |
-| Collision (echo different or missing) | inhibited at once |
+| Collision (echo different) | inhibited at once |
+| Echo missing | tolerated if the heat pump answered our 12.1 with its 12.2 (the frame went through, only our receiver missed it), up to 2 in a row; otherwise (no 12.2, 3rd in a row, or clock frame) inhibited at once |
 | Heat pump stops answering our frames | 20 cycles without a 12.2 → inhibited |
 | Inhibition | automatic resume after 30 s if no other terminal is seen, **at most 3 times per hour**; then it stays off |
 | Answer too late (> 16 ms) | dropped, the heat pump moves on |
@@ -129,7 +150,7 @@ installation.
 |---|---|
 | Emulator state | `transmission active`, `inhibited: <reason>`, `ready, transmission off`, `(room temperature frozen …)` |
 | Last bus anomaly | each foreign frame, wrong or missing echo: time, bytes, delay after the request, whether our echo was expected, frame sent |
-| Wrong echoes / Dropped answers / Answers sent per minute | health of the transmit side (~530 answers per minute) |
+| Wrong echoes / Tolerated missed echoes / Dropped answers / Answers sent per minute | health of the transmit side (~530 answers per minute) |
 | Navigator state, last error, last scan, last write | what the navigator is doing and how it ended |
 | Raw heat-pump / terminal frame, Display, Dial, Keys | live decoding |
 | Last key press | each press: keys, number of frames, heat-pump reaction and delay |

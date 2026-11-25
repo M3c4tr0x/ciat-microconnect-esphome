@@ -73,7 +73,7 @@ at ~2-3 V between the wires). A threshold around 6-8 V between the wires is need
     samples in the middle of the bit, so it does not matter: the heat pump has accepted every frame since 23 Nov
     2026.
 - On the heat pump ✅: ~530 answers per minute, the heat pump answers every one of them, no wrong echo in normal
-  operation (an isolated missed echo every few hours; the firmware resumes automatically).
+  operation. An isolated missed echo every few hours: the heat pump still answers it, so the firmware tolerates it.
 
 ## 3. ESP32 board
 

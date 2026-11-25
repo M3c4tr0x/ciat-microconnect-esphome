@@ -74,12 +74,13 @@ docs/                  protocol, hardware, emulator, Home Assistant (English + F
 hardware/              interface schematic (SVG), photos of the original terminal
 esphome/               ESPHome firmware: emulator (also listen-only) and bench test
 tools/                 PC tests of the firmware logic, raw-capture decoder
-examples/              Home Assistant dashboard view and notification automation
+examples/              Home Assistant dashboard view, notification automation, heat output package
 captures/              six raw oscilloscope captures and the decoded table of the whole campaign
 ```
 
 Run the tests: `g++ -std=c++17 -I esphome tools/test_ciat_nav.cpp -o /tmp/tn && /tmp/tn` (same for
-`test_ciat_emul.cpp`).
+`test_ciat_emul.cpp`; the bus-task test also needs the ESP-IDF stand-ins: add `-I tools/stub_idf` for
+`test_ciat_link.cpp`).
 
 ## Disclaimer
 

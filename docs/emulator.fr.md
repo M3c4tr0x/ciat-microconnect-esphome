@@ -41,7 +41,8 @@ Les noms des entités sont en anglais dans le firmware ; vous pouvez les renomme
 | Liaison | `ciat-emulator.yaml` | entités ESPHome, thermostats, scans, garde-fous |
 
 Les parties en logique pure (`ciat_emul.h`, `ciat_nav.h`) sont testées sur PC : `tools/test_ciat_emul.cpp` (trames
-réelles) et `tools/test_ciat_nav.cpp` (un simulateur du menu de la PAC, 46 cas).
+réelles) et `tools/test_ciat_nav.cpp` (un simulateur du menu de la PAC, 51 cas). La tâche du bus (`ciat_link.h`) est testée
+de la même façon, avec des fonctions ESP-IDF simulées : `tools/test_ciat_link.cpp` (contrôle d'écho et inhibitions).
 
 ## 3. Thermostats
 
@@ -85,9 +86,14 @@ réelles) et `tools/test_ciat_nav.cpp` (un simulateur du menu de la PAC, 46 cas)
 
 ## 4. Mesures et réglages
 
-- **Scan des mesures** (P40-P48, plus P50 molette sur piscine) : toutes les « Measurement scan period » (5 min par
-  défaut, 2 min convient bien), au niveau installateur. ~32 s par scan : ~8 s pour entrer au niveau installateur et
-  ~3 s pour sortir sont imposées par la PAC. Chaque valeur est moyennée sur 5 cycles (P50 : 9).
+- **Scan des mesures**, toutes les « Measurement scan period » (5 min par défaut ; 1 à 2 min conviennent bien) :
+  - au **niveau utilisateur** : P40-P42, P44, P45, P48 (plus P50 molette sur piscine), les mesures visibles à ce
+    niveau. ~17 s par scan (~3 s pour entrer dans le menu) ;
+  - au **niveau installateur**, toutes les 10 min à la place : les mêmes plus P43, P46 et P47, qui ne s'affichent
+    qu'à ce niveau. ~28 s (~8 s pour entrer au niveau installateur) ;
+  - chaque valeur est la médiane de 3 cycles (une valeur parasite d'un cycle est écartée) ; P50, qui saute à chaque
+    cycle, est moyennée sur 9.
+  - Les valeurs ne changent dans Home Assistant qu'à chaque scan : les courbes montrent des marches d'une période.
 - **Scan des réglages** (P00-P36, P49, P60-P63, P80-P99) : au démarrage puis une fois par jour. Résultats dans
   « Settings P00 to P29 » et « Settings P30 to P99 », gardés en flash.
 - Les scans ne tournent qu'avec « Automatic scan » en marche, l'émission active, et la molette sur une position qui
@@ -97,6 +103,20 @@ réelles) et `tools/test_ciat_nav.cpp` (un simulateur du menu de la PAC, 46 cas)
 - Relevé passif : avec le terminal d'origine en écoute seule, les valeurs consultées à la main dans son menu sont
   publiées aussi.
 
+### Puissance et énergie thermiques
+
+- **« Thermal power »** (kW) = 1,163 × Q × (P41 − P40), calculée toutes les 10 s, Q étant le **« Water flow
+  rate »** (m³/h, configuration) **à saisir** : la PAC ne donne pas le débit. 0 la désactive.
+- 0 compresseur arrêté, et quand le départ est plus froid que le retour (dégivrage : la chaleur reprise à l'eau est
+  ignorée, le cumul est donc un peu surestimé). Inconnue si P40/P41 n'ont pas été relus depuis 3 min.
+- **« Thermal energy »** (kWh, `total_increasing`, gardée en flash) : son intégrale, pour les statistiques à long
+  terme de Home Assistant (l'historique brut est purgé au bout de quelques jours).
+- Précision : P40 et P41 sont lus au dixième, soit ±0,1 K sur un écart de 3 à 5 K (±2-3 %), plus l'erreur sur Q.
+  Pendant les 2-3 premières minutes d'un cycle du compresseur, l'écart s'installe : la puissance affichée est plus
+  basse, et c'est réel (l'eau et l'échangeur chauffent d'abord).
+- Trouver Q : un débitmètre (à ultrasons à pince, sans toucher à la tuyauterie), la courbe du circulateur, ou le
+  [paquet Home Assistant](home-assistant.fr.md#6-puissance-calorifique-et-cop) qui l'estime d'après le COP de la notice.
+
 ## 5. Sécurité et robustesse
 
 | Situation | Comportement |
@@ -105,7 +125,8 @@ réelles) et `tools/test_ciat_nav.cpp` (un simulateur du menu de la PAC, 46 cas)
 | Redémarrage | le choix « Bus transmission » est gardé en flash ; après 20 s d'écoute, l'émission reprend, sauf si un autre terminal répond ou si le bus est muet |
 | Home Assistant ou Wi-Fi perdus | pas de redémarrage (`reboot_timeout: 0s`) ; les réponses continuent avec la dernière molette, le dernier créneau et la dernière ambiante (gardée en flash) |
 | Autre terminal sur le bus | 3 trames étrangères en 10 s → émission inhibée |
-| Collision (écho différent ou absent) | inhibée tout de suite |
+| Collision (écho différent) | inhibée tout de suite |
+| Écho absent | toléré si la PAC a répondu à notre 12.1 par sa 12.2 (la trame est passée, seule notre réception l'a ratée), jusqu'à 2 de suite ; sinon (pas de 12.2, 3ᵉ de suite, ou trame d'horloge) inhibée tout de suite |
 | La PAC ne répond plus à nos trames | 20 cycles sans 12.2 → inhibée |
 | Inhibition | reprise automatique au bout de 30 s si aucun autre terminal n'est vu, **au plus 3 fois par heure** ; ensuite elle reste coupée |
 | Réponse trop tardive (> 16 ms) | abandonnée, la PAC passe à la suite |
@@ -134,7 +155,7 @@ aucun défaut ne s'est produit sur l'installation de référence.
 |---|---|
 | Emulator state | `transmission active`, `inhibited: <cause>`, `ready, transmission off`, `(room temperature frozen …)` |
 | Last bus anomaly | chaque trame étrangère, écho différent ou absent : heure, octets, délai après la requête, écho attendu ou non, trame envoyée |
-| Wrong echoes / Dropped answers / Answers sent per minute | santé de l'émission (~530 réponses par minute) |
+| Wrong echoes / Tolerated missed echoes / Dropped answers / Answers sent per minute | santé de l'émission (~530 réponses par minute) |
 | Navigator state, last error, last scan, last write | ce que fait le navigateur et comment ça s'est terminé |
 | Raw heat-pump / terminal frame, Display, Dial, Keys | décodage en direct |
 | Last key press | chaque appui : touches, nombre de trames, réaction de la PAC et délai |

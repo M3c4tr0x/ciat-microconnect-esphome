@@ -84,9 +84,41 @@ planning dans une fenêtre surgissante suffisent pour l'usage quotidien.
 ## 5. Température ambiante
 
 Le firmware envoie à la PAC le capteur Home Assistant choisi dans `room_sensor`. Prenez un thermomètre de la pièce
-principale : la PAC s'en sert pour la compensation d'ambiance (P04). La dernière valeur valide est gardée en flash et
+principale : la PAC s'en sert pour la compensation d'ambiance (P04). Elle est envoyée au dixième de degré (la
+résolution du bus), et sa justesse compte : avec la compensation d'ambiance, chaque 0,1 °C d'erreur déplace la consigne
+d'eau de 0,1 × P04 (0,35 °C avec P04 = 3,5 ; voir [protocole §8](protocol.fr.md#8-paramètres)). La dernière valeur valide est gardée en flash et
 utilisée sans limite de durée si le capteur ou Home Assistant disparaît ; « Emulator state » affiche alors « room
 temperature frozen ».
 
 N'utilisez pas la « Terminal room temperature » de l'appareil lui-même : une fois le terminal d'origine débranché,
 elle ne fait que relire ce qu'envoie l'ESP32.
+
+## 6. Puissance calorifique et COP
+
+[`package-heat-output.yaml`](../examples/home-assistant/package-heat-output.yaml) est un paquet Home Assistant qui
+complète la **« Thermal power »** de l'émulateur (1,163 × débit × ΔT, voir [émulateur §4](emulator.fr.md#4-mesures-et-réglages)),
+dont la justesse dépend du débit d'eau saisi. Il y ajoute une estimation indépendante, tirée des données du fabricant :
+
+| Entité | Calcul |
+|---|---|
+| Heat pump COP datasheet | COP (puissance calorifique / puissance absorbée) du tableau CIAT, interpolé selon l'extérieur (P48) et le départ (P41) |
+| Heat pump heat output datasheet | COP de la notice × (puissance électrique mesurée − circulateur) |
+| Heat pump heat energy datasheet | son cumul en kWh |
+| Heat pump estimated water flow | puissance notice / (1,163 × ΔT), compresseur en marche depuis plus de 3 min |
+| Heat pump COP measured | puissance thermique de l'émulateur / puissance électrique |
+
+Mode d'emploi :
+
+1. Mesurez la puissance électrique de la PAC (prise connectée ou compteur) et indiquez son entité dans le paquet.
+2. Laissez tourner quelques jours ; la moyenne du « estimated water flow » est le débit à saisir dans le « Water flow
+   rate » de l'émulateur.
+3. La puissance et l'énergie thermiques de l'émulateur deviennent alors la référence ; les valeurs de la notice
+   restent pour comparer. Un COP mesuré qui décroche durablement du COP de la notice signale un encrassement, une
+   perte de fluide ou des dégivrages ratés.
+
+⚠️ La grille de COP du fichier est celle de l'**Aqualis 2 35H** (documentation CIAT N 08.01 A, puissances
+calorifiques, dégivrages compris, circulateur exclu). Pour une autre taille, recalculez la grille à partir du même
+tableau. La puissance du circulateur (155 W) a été mesurée sur l'installation de référence : adaptez-la.
+
+Sur l'installation de référence (35H, 6 à 9 °C dehors), les deux estimations concordaient à ~10-20 % près avant le
+recalage du débit ; le COP allait de ~3 (départ ~43 °C) à ~4,4 (départ ~31 °C).

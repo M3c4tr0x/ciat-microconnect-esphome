@@ -298,6 +298,31 @@ Numbers that do not exist: P35, P37-P39, P51-P59, P64-P79, P82-P92, P97 ✅. Par
 Bus vs sheet for the user level, on the reference installation (board P80 = 9.00): P05 and P60 are shown at user level
 although the sheet gives them no icon; P00 and P43 are not, although it does. The bus is the reference for that board.
 
+### Heating curve: how P42 is computed ✅
+
+On the reference installation (board P80 = 9.00), the computed water setpoint P42 follows, within ±0.2 °C on 194
+readings (24-25 Nov 2026, outdoor 6-9 °C, comfort and eco, room 19.9-21.7 °C):
+
+```
+P42 = base + (P19 − P15) × (P17 − Text) / (P17 − P18) + P04 × (room setpoint − room temperature)
+      base = P15 in comfort, P16 in eco
+```
+
+| Term | Reference installation | Example |
+|---|---|---|
+| base | P15 = 27, P16 = 20 °C | eco |
+| heating curve slope | (44.5 − 27) / (20 − (−8)) = 0.625 °C of water per °C of outdoor drop | Text = 8.5 °C: +7.2 |
+| room compensation | P04 = 3.5 °C of water per °C missing in the room | room = setpoint: 0 |
+
+- Example: eco, setpoint 20, room 20.0, outside 8.5 °C → 20 + 7.2 + 0 = **27.2**; the heat pump showed 27.1.
+  Comfort, setpoint 22, room 20.3, outside 8.3 °C → 27 + 7.3 + 6.0 = **40.3**; the heat pump showed 40.3.
+- The eco curve is the comfort curve shifted down by P15 − P16 (it does not end at P19).
+- 🟡 Floor: once, the formula gave 16.8 and the heat pump showed **20.0** (eco setpoint 18.5, room 21.7). A minimum
+  water setpoint of 20 °C (P16, or a fixed limit) is likely; seen only once.
+- ❓ Not observed: the curve below P18 (clamped at P19?) or above P17, and the cooling curve (P10-P14).
+- Room compensation weighs a lot: a room 1.7 °C under the comfort setpoint added 6 °C to the water, and the
+  room temperature sent by the terminal (or the emulator) drives P42 directly.
+
 ### 8.1 Later controller boards (P80 = 22.00)
 
 A later CIAT sheet, "Paramétrage et liste code défauts — µconnect 2 et µconnect 2+ ou 2x, version P80 = V22.00"

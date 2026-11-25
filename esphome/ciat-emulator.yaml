@@ -94,6 +94,12 @@ globals:   # the parser itself is in ciat_bus.h (ciat::parser())
   - id: t_slow_scan
     type: uint32_t
     initial_value: '0'
+  - id: t_installer_scan   # millis() of the last measurement scan at installer level (P43, P46, P47)
+    type: uint32_t
+    initial_value: '0'
+  - id: t_supply_return   # millis() of the last reading of P40 or P41 (thermal power: recent value only)
+    type: uint32_t
+    initial_value: '0'
   - id: slow_scan_due    # slow scan to do as soon as possible (boot, after a write)
     type: bool
     initial_value: 'true'
@@ -162,6 +168,7 @@ interval:
               s->publish_state(m * 60 + sec);
               return;
             }
+            if (p == 40 || p == 41) id(t_supply_return) = millis();
             if (s) { s->publish_state(l.val); return; }  // NAN for "----" (P42 when the heat pump asks for nothing)
             // Settings: two texts "P04=3.5 P05=0 …" (an HA state is limited to 255 characters).
             const bool upper = p >= 30;
@@ -449,10 +456,15 @@ interval:
           if (!ciat::nav::dial_allows_menu(m)) return;
           std::string err;
           uint32_t period = (uint32_t) id(nb_scan_period).state * 60000UL;
+          // Fast: at user level (~17 s), every period. Installer: every measurement, including P43, P46 and P47,
+          // every 10 min. Slow: every setting, once a day.
           bool fast_due = id(t_fast_scan) == 0 || millis() - id(t_fast_scan) >= period;
+          bool inst_due = id(t_installer_scan) == 0 || millis() - id(t_installer_scan) >= 10UL * 60000UL;
           bool slow_due = id(slow_scan_due) || millis() - id(t_slow_scan) >= 24UL * 3600UL * 1000UL;
-          if (fast_due) {
-            if (nv.scan(ciat::nav::fast_list(m == 8), err)) id(t_fast_scan) = millis();
+          if (inst_due && fast_due) {
+            if (nv.scan(ciat::nav::fast_list(m == 8), err)) id(t_fast_scan) = id(t_installer_scan) = millis();
+          } else if (fast_due) {
+            if (nv.scan(ciat::nav::user_list(m == 8), err, false)) id(t_fast_scan) = millis();
           } else if (slow_due) {
             if (nv.scan(ciat::nav::slow_list(), err)) {
               id(t_slow_scan) = millis();
@@ -570,13 +582,35 @@ interval:
           auto a = ciat::link::link().anomaly();
           if (a.no == seen) return;
           seen = a.no;
-          static const char *const T[] = {"", "foreign frame", "wrong echo", "missing echo"};
+          static const char *const T[] = {"", "foreign frame", "wrong echo", "missing echo",
+                                          "missing echo but the heat pump answered (tolerated)"};
           char t[220];
           snprintf(t, sizeof t, "%s %s: %s, %.1f ms after the request, echo %s, sent %s",
-                   id(ha_time).now().strftime("%d/%m %H:%M:%S").c_str(), T[a.type < 4 ? a.type : 0], ciat::hex(a.b, a.n).c_str(),
+                   id(ha_time).now().strftime("%d/%m %H:%M:%S").c_str(), T[a.type < 5 ? a.type : 0], ciat::hex(a.b, a.n).c_str(),
                    a.delay_us / 1000.0f, a.expected ? "expected" : "not expected", ciat::hex(a.tx, a.tx_n).c_str());
           id(bus_anomaly).publish_state(t);
           ESP_LOGW("ciat", "anomaly: %s", t);
+
+  # Thermal power delivered to the water: 1.163 × Q × (P41 − P40), in kW, Q in m³/h ("Water flow rate", to be
+  # entered: the heat pump does not report it). 0 while the compressor is off (heat left in the water is not
+  # production) and during a defrost (negative ΔT, heat taken back from the water: ignored, so the total is slightly
+  # over-estimated). Unknown if Q = 0 or if P40/P41 have not been read for 3 min.
+  - interval: 10s
+    then:
+      - lambda: |-
+          float q = id(nb_flow).state, d = id(p41).state, r = id(p40).state;
+          bool fresh = id(t_supply_return) != 0 && millis() - id(t_supply_return) < 180000UL;
+          float pw = NAN;
+          if (!std::isnan(q) && q > 0 && fresh && !std::isnan(d) && !std::isnan(r)) {
+            float dt = d - r;
+            pw = (id(compressor).state && dt > 0) ? 1.163f * q * dt : 0.0f;
+          }
+          // A 0 before going unknown: the integration ignores NAN and, when values come back, would count the whole
+          // gap at the last known power.
+          static bool unknown = true;
+          if (std::isnan(pw) && !unknown) id(thermal_power).publish_state(0.0f);
+          unknown = std::isnan(pw);
+          id(thermal_power).publish_state(pw);
 
   # Bus active: false after 5 s without a valid frame (other entities otherwise keep their last value).
   - interval: 1s
@@ -607,10 +641,14 @@ interval:
           // Room temperature: the last valid value is used with no time limit if Home Assistant or the sensor
           // disappears, and it is kept in flash (reboot without HA). Without a room temperature the 12.1 cannot be
           // built and the emulator would stay silent: the heat pump would not restart after a power cut.
+          // The saved value is rounded to the tenth (bus resolution) and rewritten as soon as that tenth changes.
+          // (A rule "rewrite only 0.1 °C away from the last raw value" kept sending 20.0 for hours while the sensor
+          // read 19.86: 19.96 saved, difference 0.0999.)
           float x = id(room_ha).state;
           if (!std::isnan(x) && x > -20.0f && x < 50.0f) {
             float &sv = id(saved_room_temp);
-            if (std::isnan(sv) || std::fabs(sv - x) >= 0.1f) sv = x;  // flash write grouped by ESPHome (1 min)
+            float r = lroundf(x * 10.0f) / 10.0f;
+            if (std::isnan(sv) || lroundf(sv * 10.0f) != lroundf(r * 10.0f)) sv = r;  // flash: grouped write (1 min)
           }
           c.room_temp = id(saved_room_temp);
           auto now = id(ha_time).now();
@@ -662,6 +700,7 @@ interval:
           id(bursts_no_edge_min).publish_state(s.no_edge);
           id(answers_min).publish_state(s.sent);
           id(bad_echoes_min).publish_state(s.echo_bad);
+          id(missed_echoes_min).publish_state(s.echo_missed);
           id(too_late_min).publish_state(s.too_late);
           id(shadow_diffs_min).publish_state(s.shadow_diffs);
           id(shadow_checked_min).publish_state(s.shadow_n);
@@ -682,6 +721,25 @@ sensor:
     name: Uptime
     entity_category: diagnostic
     update_interval: 60s
+  - platform: template
+    id: thermal_power
+    name: Thermal power
+    unit_of_measurement: kW
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  # Total in kWh (Home Assistant long-term statistics). Integrated at each publication (every 10 s), kept in flash.
+  - platform: integration
+    name: Thermal energy
+    sensor: thermal_power
+    time_unit: h
+    integration_method: left
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 2
   # Parameters read (navigator, or passive survey when someone views them on the terminal)
   - platform: template
     id: p40
@@ -850,6 +908,11 @@ sensor:
   - platform: template
     id: bad_echoes_min
     name: Wrong echoes per minute
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: missed_echoes_min
+    name: Tolerated missed echoes per minute
     entity_category: diagnostic
     update_interval: never
   - platform: template
@@ -1150,6 +1213,20 @@ select:
     restore_value: true
 
 number:
+  # Water flow rate of the heating circuit, for the thermal power: to be found (flow meter, circulator curve, heat
+  # pump manual). 0 = thermal power disabled. Not measured by the heat pump.
+  - platform: template
+    id: nb_flow
+    name: Water flow rate
+    unit_of_measurement: "m³/h"
+    min_value: 0
+    max_value: 10
+    step: 0.01
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
   - platform: template
     id: nb_scan_period
     name: Measurement scan period

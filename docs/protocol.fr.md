@@ -310,6 +310,31 @@ Bus et fiche pour le niveau client, sur l'installation de référence (carte P80
 niveau client alors que la fiche ne leur donne pas d'icône ; P00 et P43 ne le sont pas, alors qu'elle leur en donne
 une. Pour cette carte, le bus fait foi.
 
+### Loi d'eau : calcul de P42 ✅
+
+Sur l'installation de référence (carte P80 = 9.00), la consigne d'eau calculée P42 suit, à ±0,2 °C près sur 194
+relevés (24-25/11/2026, extérieur 6 à 9 °C, confort et éco, ambiante 19,9 à 21,7 °C) :
+
+```
+P42 = base + (P19 − P15) × (P17 − Text) / (P17 − P18) + P04 × (consigne d'ambiance − ambiante)
+      base = P15 en confort, P16 en éco
+```
+
+| Terme | Installation de référence | Exemple |
+|---|---|---|
+| base | P15 = 27, P16 = 20 °C | éco |
+| pente de la loi d'eau | (44,5 − 27) / (20 − (−8)) = 0,625 °C d'eau par °C extérieur en moins | Text = 8,5 °C : +7,2 |
+| compensation d'ambiance | P04 = 3,5 °C d'eau par °C manquant dans la pièce | ambiante = consigne : 0 |
+
+- Exemple : éco, consigne 20, ambiante 20,0, extérieur 8,5 °C → 20 + 7,2 + 0 = **27,2** ; la PAC affichait 27,1.
+  Confort, consigne 22, ambiante 20,3, extérieur 8,3 °C → 27 + 7,3 + 6,0 = **40,3** ; la PAC affichait 40,3.
+- La courbe éco est la courbe confort décalée de P15 − P16 vers le bas (elle n'aboutit pas à P19).
+- 🟡 Plancher : une fois, la formule donnait 16,8 et la PAC affichait **20,0** (consigne éco 18,5, ambiante 21,7).
+  Une consigne d'eau minimale de 20 °C (P16, ou une limite fixe) est probable ; vu une seule fois.
+- ❓ Pas observé : la courbe sous P18 (plafonnée à P19 ?) ou au-dessus de P17, et la loi d'eau en froid (P10-P14).
+- La compensation d'ambiance pèse lourd : une pièce à 1,7 °C sous la consigne confort a ajouté 6 °C à l'eau, et
+  l'ambiante envoyée par le terminal (ou l'émulateur) pilote directement P42.
+
 ### 8.1 Cartes de régulation plus récentes (P80 = 22.00)
 
 Une fiche CIAT plus récente, « Paramétrage et liste code défauts — µconnect 2 et µconnect 2+ ou 2x, version P80 =

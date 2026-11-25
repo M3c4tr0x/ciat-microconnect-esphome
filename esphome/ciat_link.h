@@ -17,7 +17,8 @@
 //   - never speaks on its own: only in answer to a valid heat-pump request, at most 7 bytes;
 //   - inhibition (re-armed by the switch, or resumed automatically after 30 s, see ciat-emulator.yaml) when:
 //       another terminal answers on the bus (3 foreign frames within 10 s), the echo differs from what was sent
-//       (collision), or the heat pump stops sending 12.2 after our 12.1 (20 cycles in a row: it refuses our answers);
+//       (collision), the echo is missing and the heat pump does not answer (or 3 times in a row even if it does),
+//       or the heat pump stops sending 12.2 after our 12.1 (20 cycles in a row: it refuses our answers);
 //   - an answer is dropped when it can no longer leave in time (more than 16 ms after the start of the request).
 #pragma once
 #include <cstring>
@@ -45,7 +46,8 @@ inline const char *inhibition_name(uint8_t i) {
 }
 
 // Last anomaly seen on the bus (diagnostic of inhibitions).
-// type: 1 terminal frame not recognised as our echo, 2 wrong echo, 3 echo never received complete.
+// type: 1 terminal frame not recognised as our echo, 2 wrong echo, 3 echo never received complete,
+// 4 echo never received but the heat pump answered with a 12.2 (tolerated).
 struct Anomaly {
   uint8_t type = 0;
   uint8_t b[16] = {};      // frame (1, 2) or last burst before the next request (3)
@@ -61,6 +63,7 @@ struct Anomaly {
 struct Stats {
   uint32_t req12 = 0, req14 = 0;             // heat-pump requests
   uint32_t sent = 0, echo_ok = 0, echo_bad = 0, too_late = 0;
+  uint32_t echo_missed = 0;                  // echo not read back although the heat pump answered (tolerated)
   uint32_t shadow_n = 0, shadow_diffs = 0;   // real terminal's 12.1 checked / with a difference
   uint8_t shadow_last = 0;                   // mask of the last difference (emu::shadow_diffs)
   uint8_t shadow_frame[7] = {};              // 12.1 that caused it
@@ -84,6 +87,9 @@ class Link {
   static const int64_t LIMIT_US = 16000;   // beyond this, the answer is dropped
   static const int64_t TERMINAL_SEEN_US = 10LL * 1000 * 1000;  // another terminal seen less than 10 s ago: no transmission
   static const int NO_122_MAX = 20;
+  // Missed echo but 12.2 from the heat pump received: our frame went through, only our receiver missed it (seen on
+  // the reference installation: 12.2 at 25.6 ms, normal delay). Tolerated up to ECHO_MISSED_MAX - 1 times in a row.
+  static const int ECHO_MISSED_MAX = 3;
   static const int FOREIGN_MAX = 3;        // foreign frames within 10 s before concluding there is another terminal
   static const int64_t READ_MAX_US = 8000; // beyond this, the last edge could be the answer's (~10 ms)
 
@@ -146,7 +152,7 @@ class Link {
   void allow(bool on) {
     portENTER_CRITICAL(&mux_);
     allowed_ = on && tx_ >= 0;
-    if (on) { inhib_ = NONE; no_122_ = 0; }
+    if (on) { inhib_ = NONE; no_122_ = 0; echo_missed_ = 0; }
     portEXIT_CRITICAL(&mux_);
   }
   bool tx_compiled() const { return tx_ >= 0; }
@@ -275,14 +281,18 @@ class Link {
   }
 
   void request_(uint8_t cmd, int64_t t0) {
-    // An answer sent in the previous cycle whose echo never came back complete: probable collision.
+    // An answer sent in the previous cycle whose echo never came back complete. If it was a 12.1 and the heat pump
+    // answered it with a 12.2, the frame went through: only our receiver missed it, tolerated (except 3 times in a
+    // row). Otherwise (14.1, or no 12.2): probable collision, inhibition.
     if (sending_) {
       sending_ = false;
-      record_(3, prev_burst_, prev_nb_, prev_t_ - req_t0_, true);
+      bool accepted = req_cmd_ == 0x12 && sent12_ && seen122_;
+      bool tolerated = accepted && ++echo_missed_ < ECHO_MISSED_MAX;
+      record_(tolerated ? 4 : 3, prev_burst_, prev_nb_, prev_t_ - req_t0_, true);
       portENTER_CRITICAL(&mux_);
-      st_.echo_bad++;
+      (tolerated ? st_.echo_missed : st_.echo_bad)++;
       portEXIT_CRITICAL(&mux_);
-      inhibit_(COLLISION);
+      if (!tolerated) inhibit_(COLLISION);
     }
     if (cmd == 0x12) {
       if (sent12_ && !seen122_) { if (++no_122_ >= NO_122_MAX) inhibit_(HP_SILENT); }
@@ -346,6 +356,7 @@ class Link {
       portENTER_CRITICAL(&mux_);
       (ok ? st_.echo_ok : st_.echo_bad)++;
       portEXIT_CRITICAL(&mux_);
+      if (ok) echo_missed_ = 0;
       if (!ok) { record_(2, f, L, delay, true); inhibit_(COLLISION); }
       return;
     }
@@ -418,6 +429,7 @@ class Link {
   uint8_t req_cmd_ = 0, req_code_ = 6, p1_ = 0;
   bool has_p1_ = false, req_has_p1_ = false, sent12_ = false, seen122_ = false;
   int no_122_ = 0;
+  int echo_missed_ = 0;  // echoes missed in a row (tolerated if the heat pump answered)
   uint8_t tx_buf_[8] = {};
   size_t tx_len_ = 0;
   volatile bool sending_ = false;

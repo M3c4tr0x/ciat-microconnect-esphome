@@ -1,0 +1,102 @@
+# Heat output and COP of a CIAT Aqualis 2 **35H**, for Home Assistant (example).
+#
+# Install: put this file in a Home Assistant "packages" folder (configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# ), check the configuration, then restart Home Assistant (needed once for the integration sensor).
+#
+# Before use, replace:
+#   - sensor.heat_pump_electrical_power: the electrical power of the heat pump in W (smart plug, energy meter...);
+#   - sensor.ciat_heat_pump_...: the entity ids of your emulator if you renamed the device;
+#   - the COP grid `g` if your model is not a 35H (see below).
+#
+# Two independent estimates of the heat output:
+#   - MEASURED (ESP32, sensor.ciat_heat_pump_thermal_power) = 1.163 × flow × (supply − return); depends on the
+#     "Water flow rate" entered on the device (the heat pump does not report it);
+#   - DATASHEET (this file) = datasheet COP × measured electrical power minus 155 W of circulator (measured at rest on
+#     the reference installation: adjust). COP interpolated, by outdoor temperature (P48) and supply temperature (P41),
+#     in the "heating capacities" table of the CIAT Aqualis 2 documentation N 08.01 A (Pc / Pa of the 35H, defrosts
+#     included, circulator excluded). The grid below holds Pc / Pa for outdoor -15 to 20 °C (rows, step 5) and supply
+#     25 to 55 °C (columns, step 5); empty cells of the table (outside the operating limits) repeat the last value.
+# "Estimated water flow" = DATASHEET output / (1.163 × ΔT), compressor running for more than 3 min (ΔT settles in 2-3
+# min) and ΔT >= 2 K. Its average over several days gives the flow to enter in the ESP32; the MEASURED value then
+# becomes the reference, the DATASHEET one stays as a comparison (a measured COP drifting below the datasheet COP
+# points to fouling, refrigerant loss or poor defrosting).
+# Compressor off: outputs at 0, COPs unavailable.
+
+template:
+  - sensor:
+      - name: Heat pump COP datasheet
+        unique_id: ciat_cop_datasheet
+        icon: mdi:book-open-variant
+        state_class: measurement
+        availability: "{{ is_state('binary_sensor.ciat_heat_pump_compressor', 'on') }}"
+        state: >-
+          {%- set ext = states('sensor.ciat_heat_pump_p48_outdoor_temperature') | float(none) -%}
+          {%- set dep = states('sensor.ciat_heat_pump_p41_flow_water') | float(none) -%}
+          {%- if ext is none or dep is none -%}{{ none }}{%- else -%}
+          {%- set es = [-15, -10, -5, 0, 5, 10, 15, 20] -%}
+          {%- set ds = [25, 30, 35, 40, 45, 50, 55] -%}
+          {%- set g = [[2.43, 2.20, 1.86, 1.65, 1.65, 1.65, 1.65], [2.77, 2.44, 2.14, 1.94, 1.56, 1.56, 1.56], [3.14, 2.76, 2.36, 2.06, 1.74, 1.50, 1.50], [3.59, 3.12, 2.79, 2.42, 2.11, 1.80, 1.65], [4.59, 4.00, 3.54, 3.16, 2.80, 2.42, 2.21], [5.18, 4.71, 4.11, 3.55, 3.11, 2.74, 2.37], [5.86, 5.25, 4.59, 4.07, 3.53, 3.11, 2.73], [6.81, 5.88, 5.11, 4.50, 4.00, 3.42, 3.05]] -%}
+          {%- set e = [[ext, -15] | max, 20] | min -%}
+          {%- set t = [[dep, 25] | max, 55] | min -%}
+          {%- set i = [((e + 15) / 5) | int, 6] | min -%}
+          {%- set j = [((t - 25) / 5) | int, 5] | min -%}
+          {%- set fe = (e - es[i]) / 5 -%}
+          {%- set ft = (t - ds[j]) / 5 -%}
+          {%- set c0 = g[i][j] * (1 - ft) + g[i][j + 1] * ft -%}
+          {%- set c1 = g[i + 1][j] * (1 - ft) + g[i + 1][j + 1] * ft -%}
+          {{ (c0 * (1 - fe) + c1 * fe) | round(2) }}
+          {%- endif -%}
+
+      - name: Heat pump heat output datasheet
+        unique_id: ciat_heat_output_datasheet
+        unit_of_measurement: kW
+        device_class: power
+        state_class: measurement
+        state: >-
+          {%- if not is_state('binary_sensor.ciat_heat_pump_compressor', 'on') -%}0
+          {%- else -%}
+          {%- set cop = states('sensor.heat_pump_cop_datasheet') | float(none) -%}
+          {%- set pe = states('sensor.heat_pump_electrical_power') | float(none) -%}
+          {%- if cop is none or pe is none -%}{{ none }}{%- else -%}
+          {{ (cop * ([pe - 155, 0] | max) / 1000) | round(2) }}
+          {%- endif -%}{%- endif -%}
+
+      - name: Heat pump estimated water flow
+        unique_id: ciat_estimated_water_flow
+        unit_of_measurement: "m³/h"
+        state_class: measurement
+        icon: mdi:waves-arrow-right
+        availability: >-
+          {%- set d = states('sensor.ciat_heat_pump_p41_flow_water') | float(0) -%}
+          {%- set r = states('sensor.ciat_heat_pump_p40_return_water') | float(0) -%}
+          {%- set c = states.binary_sensor.ciat_heat_pump_compressor -%}
+          {{ c is not none and c.state == 'on' and now() - c.last_changed > timedelta(minutes=3) and (d - r) >= 2 }}
+        state: >-
+          {%- set p = states('sensor.heat_pump_heat_output_datasheet') | float(none) -%}
+          {%- set dt = states('sensor.ciat_heat_pump_p41_flow_water') | float(0)
+                      - states('sensor.ciat_heat_pump_p40_return_water') | float(0) -%}
+          {{ (p / (1.163 * dt)) | round(2) if p is not none and dt > 0 else none }}
+
+      - name: Heat pump COP measured
+        unique_id: ciat_cop_measured
+        icon: mdi:gauge
+        state_class: measurement
+        availability: "{{ is_state('binary_sensor.ciat_heat_pump_compressor', 'on') }}"
+        state: >-
+          {%- set pt = states('sensor.ciat_heat_pump_thermal_power') | float(none) -%}
+          {%- set pe = states('sensor.heat_pump_electrical_power') | float(none) -%}
+          {{ (pt / (pe / 1000)) | round(2) if pt is not none and pe is not none and pe > 500 else none }}
+
+# Total of the DATASHEET heat output, to compare with the ESP32's "Thermal energy" (long-term statistics).
+sensor:
+  - platform: integration
+    name: Heat pump heat energy datasheet
+    unique_id: ciat_heat_energy_datasheet
+    source: sensor.heat_pump_heat_output_datasheet
+    unit_prefix: null
+    round: 2
+    method: left
+    max_sub_interval:
+      minutes: 1

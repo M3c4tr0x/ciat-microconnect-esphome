@@ -301,6 +301,49 @@ int main() {
     CHECK(b.count(Event::VALUE) == 9 && b.count(Event::ERROR) == 0, "next scan: 9 values in %.0f s", c2 * 0.222);
   }
 
+  // 1 ter. Scan at user level: entry ~3 s, 6 measurements, never the installer level.
+  for (int last : {48, 45, 9}) {
+    Bench b;
+    b.hp.last = last;
+    std::string err;
+    bool r = b.nav.scan(user_list(false), err, false);
+    bool never_inst = true;
+    int c = 0;
+    b.one_cycle();
+    while (b.nav.busy() && c < 4000) { b.one_cycle(); c++; never_inst &= !b.hp.inst; }
+    for (int i = 0; i < 5; i++) b.one_cycle();
+    b.errors();
+    bool right = true;
+    for (int p : user_list(false)) {
+      const Event *e = b.find(Event::VALUE, p);
+      const Param &q = b.hp.par[p];
+      right &= e && (q.dec < 0 ? std::isnan(e->reading.val) : equal(e->reading.val, q.v));
+    }
+    CHECK(r && right && never_inst && b.count(Event::VALUE) == 6 && b.count(Event::ERROR) == 0 &&
+              b.count(Event::ABSENT) == 0 && !b.hp.menu && b.hp.changes == 0,
+          "user-level scan (menu reopened after P%02d): 6 right values, never the installer level, %d cycles = %.0f s",
+          last, c, c * 0.222);
+  }
+  {
+    Bench b;  // pool: P50 visible at user level, average over 9 cycles
+    b.hp.last = 48;
+    std::string err;
+    b.nav.scan(user_list(true), err, false);
+    int c = b.run();
+    const Event *e = b.find(Event::VALUE, 50);
+    CHECK(e && std::fabs(e->reading.val - 18.3f) < 0.11f && b.count(Event::VALUE) == 7 && b.count(Event::ERROR) == 0,
+          "user-level scan, pool: 7 values, P50 = %s (%d cycles = %.0f s)", e ? e->reading.txt.c_str() : "?", c, c * 0.222);
+  }
+  {
+    Bench b;  // P43 asked at user level: absent, no error
+    b.hp.last = 41;
+    std::string err;
+    b.nav.scan({42, 43, 44}, err, false);
+    b.run();
+    CHECK(b.find(Event::ABSENT, 43) && b.count(Event::VALUE) == 2 && b.count(Event::ERROR) == 0,
+          "user-level scan: P43 (installer level only) reported absent, without error");
+  }
+
   // 2. Slow list: absent parameters (P07, P21 with P06 = 3; P35 does not exist; P61-P63 with P60 = 0)
   {
     Bench b;

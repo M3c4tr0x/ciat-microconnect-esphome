@@ -77,7 +77,7 @@ reste à ~2-3 V entre les fils). Il faut un seuil vers 6-8 V entre les fils, ce 
     des transistors. Une UART lit au milieu du bit : c'est sans effet, et la PAC accepte toutes les trames
     depuis le 23/11/2026.
 - Sur la PAC ✅ : ~530 réponses par minute, la PAC répond à chacune, pas d'écho faux en fonctionnement normal (un
-  écho raté isolé toutes les quelques heures ; le firmware reprend seul).
+  écho raté isolé toutes les quelques heures : la PAC y répond quand même, le firmware le tolère).
 
 ## 3. Carte ESP32
 

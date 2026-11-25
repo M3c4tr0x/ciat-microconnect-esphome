@@ -121,6 +121,14 @@ inline std::vector<int> fast_list(bool pool) {
   if (pool) l.push_back(50);
   return l;
 }
+// Frequent scan at user level (entry ~3 s instead of ~8 s): the measurements visible at that level (P40-P42, P44,
+// P45, P48, P50 ✅). P43, P46 and P47 are only shown at installer level: they stay in fast_list(), read at installer
+// level less often.
+inline std::vector<int> user_list(bool pool) {
+  std::vector<int> l = {40, 41, 42, 44, 45, 48};
+  if (pool) l.push_back(50);
+  return l;
+}
 inline std::vector<int> slow_list() {
   std::vector<int> l;
   for (int p = 0; p <= 36; p++) l.push_back(p);
@@ -342,7 +350,8 @@ class Navigator {
   static const int EXIT_FRAMES = 18;       // long OK: exit ~12-13 frames after the start of the press
   static const int EXIT_MAX = 30;
   static const int READINGS = 3;           // setting: value read over 3 cycles (median)
-  static const int READINGS_MEASURE = 5;   // measurement (P40-P48): average over 5 cycles (~1.1 s)
+  static const int READINGS_MEASURE = 3;   // measurement (P40-P48): median over 3 cycles (~0.7 s); a one-cycle
+                                           // glitch is still rejected
   static const int READINGS_P50 = 9;       // P50 jumps at every cycle (18.0 to 18.8): average over 9 cycles
   static const int MAX_NAV_STEPS = 60;
   static const int MAX_WRITE_STEPS = 120;  // water setpoint 20 → 70 by 0.5 = 100 steps
@@ -365,14 +374,16 @@ class Navigator {
 
   // --- commands ---
 
-  // Reads the parameters of the list, at installer level. False (and err) if the navigator is busy.
-  bool scan(const std::vector<int> &list, std::string &err) {
+  // Reads the parameters of the list, at installer level, or at user level if installer = false (entry ~3 s instead
+  // of ~8 s; parameters hidden at that level are then reported absent). False (and err) if the navigator is busy.
+  bool scan(const std::vector<int> &list, std::string &err, bool installer = true) {
     if (!free_(err)) return false;
     if (list.empty()) { err = "empty list"; return false; }
     targets_ = list;
     std::sort(targets_.begin(), targets_.end());
     targets_.erase(std::unique(targets_.begin(), targets_.end()), targets_.end());
     writing_ = false;
+    installer_level_ = installer;
     begin_();
     return true;
   }
@@ -381,6 +392,7 @@ class Navigator {
   bool write(int p, float v, std::string &err) {
     if (!free_(err)) return false;
     if (!write_allowed(p, v, err)) return false;
+    installer_level_ = true;
     targets_.assign(1, p);
     writing_ = true;
     target_val_ = v;
@@ -589,7 +601,8 @@ class Navigator {
 
   void track_entry_() {
     int elapsed = t_ - act_t_;
-    if (v_.installer && v_.screen == Screen::NUMBER) {
+    bool reached = installer_level_ ? v_.installer : v_.menu;
+    if (reached && v_.screen == Screen::NUMBER) {
       keys_out_ = Keys{0, 0};  // release
       has_keys_out_ = true;
       action_ = false;
@@ -825,14 +838,14 @@ class Navigator {
   }
   void reread_() { read_(); }
 
-  // Measurement: average to the tenth; setting: median of the numeric values; otherwise the last text.
+  // P50: average to the tenth; other measurements and settings: median of the numeric values; otherwise the last text.
   Reading summary_() const {
     Reading l;
     std::vector<float> xs;
     for (const View &v : readings_)
       if (!std::isnan(v.val)) xs.push_back(v.val);
     l.ok = true;
-    if (xs.size() == readings_.size() && is_measurement(targets_[i_])) {
+    if (xs.size() == readings_.size() && targets_[i_] == 50) {  // P50 jumps at every cycle: average over 9
       double sm = 0;
       for (float x : xs) sm += x;
       l.val = mean_tenth(sm, (int) xs.size());
@@ -915,6 +928,7 @@ class Navigator {
   bool stop_requested_ = false, interrupted_ = false;  // scan stop requested by the thermostat
   float sp_min_ = SETPOINT_MIN, sp_max_ = SETPOINT_MAX;  // limits of the current setpoint adjustment
   bool writing_ = false, has_orig_ = false, in_error_ = false, resume_ = false;
+  bool installer_level_ = true;  // level aimed at when entering the menu (scan)
   float target_val_ = NAN, orig_ = NAN, from_val_ = NAN;
   std::vector<View> readings_;
   // action in progress

@@ -81,8 +81,39 @@ pop-up is enough for daily use.
 ## 5. Room temperature
 
 The firmware sends the Home Assistant sensor set in `room_sensor` to the heat pump. Choose a thermometer in the main
-room: the heat pump uses it for room compensation (P04). The last valid value is kept in flash and used without time
+room: the heat pump uses it for room compensation (P04). It is sent to the tenth of a degree (the resolution of the
+bus), and its accuracy matters: with room compensation, each 0.1 °C of error moves the water setpoint by 0.1 × P04
+(0.35 °C with P04 = 3.5; see [protocol §8](protocol.md#8-parameters)). The last valid value is kept in flash and used without time
 limit if the sensor or Home Assistant disappears; "Emulator state" then says "room temperature frozen".
 
 Do not use the device's own "Terminal room temperature": once the original terminal is unplugged, it only reads back
 what the ESP32 sends.
+
+## 6. Heat output and COP
+
+[`package-heat-output.yaml`](../examples/home-assistant/package-heat-output.yaml) is a Home Assistant package that
+complements the emulator's **"Thermal power"** (1.163 × flow × ΔT, see [emulator §4](emulator.md#4-measurements-and-settings)),
+whose accuracy depends on the water flow you enter. It adds an independent estimate from the manufacturer's data:
+
+| Entity | Computation |
+|---|---|
+| Heat pump COP datasheet | COP (heating capacity / absorbed power) of the CIAT table, interpolated by outdoor (P48) and supply (P41) temperature |
+| Heat pump heat output datasheet | datasheet COP × (measured electrical power − circulator) |
+| Heat pump heat energy datasheet | its total in kWh |
+| Heat pump estimated water flow | datasheet output / (1.163 × ΔT), compressor running for more than 3 min |
+| Heat pump COP measured | emulator's thermal power / electrical power |
+
+How to use it:
+
+1. Measure the heat pump's electrical power (smart plug or energy meter) and set its entity in the package.
+2. Let it run for a few days; the average of "estimated water flow" is the flow to enter in the emulator's "Water
+   flow rate".
+3. The emulator's thermal power and energy then become the reference; the datasheet values stay as a comparison. A
+   measured COP drifting below the datasheet COP over weeks points to fouling, refrigerant loss or poor defrosting.
+
+⚠️ The COP grid in the file is the **Aqualis 2 35H** one (CIAT documentation N 08.01 A, heating capacities, defrosts
+included, circulator excluded). For another size, recompute the grid from the same table. The circulator power
+(155 W) was measured on the reference installation: adjust it.
+
+On the reference installation (35H, 6-9 °C outside), the two estimates agreed within ~10-20 % before the flow was
+calibrated; the COP ranged from ~3 (supply ~43 °C) to ~4.4 (supply ~31 °C).
